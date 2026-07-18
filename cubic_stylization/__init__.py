@@ -9,6 +9,11 @@ bl_info = {
     "category": "Mesh",
 }
 
+import os
+import site
+import subprocess
+import sys
+import threading
 import time
 
 import bpy
@@ -120,7 +125,8 @@ class CubifySettings(bpy.types.PropertyGroup):
     device: bpy.props.EnumProperty(
         name="Device",
         description="Where the solver runs. GPU devices need PyTorch installed "
-                    "in Blender's Python (see the add-on README)",
+                    "in Blender's Python (one-click install in the add-on "
+                    "preferences)",
         items=[
             ('AUTO', "Auto", "GPU for large meshes when available, else CPU"),
             ('CPU', "CPU", "numpy solver (always available)"),
@@ -492,6 +498,10 @@ class VIEW3D_PT_cubify(bpy.types.Panel):
             if props.device in {'CUDA', 'MPS'} and not has_torch:
                 layout.label(text="PyTorch not installed: will use CPU",
                              icon='ERROR')
+                op = layout.operator("preferences.addon_show",
+                                     text="Install in Add-on Preferences",
+                                     icon='PREFERENCES')
+                op.module = __package__
             elif props.device == 'CUDA' and not cuda:
                 layout.label(text="CUDA not available: will use CPU",
                              icon='ERROR')
@@ -517,16 +527,205 @@ class VIEW3D_PT_cubify(bpy.types.Panel):
         box.operator(OBJECT_OT_arap_manipulate.bl_idname, icon='ORIENTATION_GIMBAL')
 
 
+# ================== Preferences: one-click PyTorch install
+
+# Install state shared between the worker thread, the watcher timer and the
+# preferences UI. Only the worker writes ok/msg/used_user; the UI only reads.
+_TORCH_INSTALL = {"thread": None, "ok": None, "msg": "", "used_user": False}
+
+
+def _torch_pip_command():
+    """The pip command for this platform.
+
+    macOS: the default PyPI wheel ships MPS support. Linux: the default
+    wheel bundles CUDA. Windows: the default wheel is CPU-only, so the
+    CUDA index is needed.
+    """
+    cmd = [sys.executable, "-m", "pip", "install", "torch"]
+    if sys.platform.startswith("win"):
+        cmd += ["--index-url", "https://download.pytorch.org/whl/cu126"]
+    return cmd
+
+
+def _user_site_dir():
+    try:
+        return site.getusersitepackages()
+    except Exception:
+        return None
+
+
+def _install_torch_worker():
+    """Runs in a background thread so Blender stays responsive during the
+    (possibly multi-GB) download. subprocess only — no bpy access here."""
+    def run(cmd):
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        print(proc.stdout)  # full pip log to the system console
+        return proc
+
+    try:
+        run([sys.executable, "-m", "ensurepip", "--upgrade"])  # pip may be absent
+        proc = run(_torch_pip_command())
+        out = proc.stdout or ""
+        if proc.returncode != 0 and ("ermission denied" in out
+                                     or "ccess is denied" in out
+                                     or "WinError 5" in out):
+            # site-packages not writable (e.g. Blender in Program Files):
+            # retry in the per-user site, which register() adds to sys.path
+            _TORCH_INSTALL["used_user"] = True
+            proc = run(_torch_pip_command() + ["--user"])
+            out = proc.stdout or ""
+        if proc.returncode != 0:
+            tail = "\n".join(out.strip().splitlines()[-3:])
+            _TORCH_INSTALL["ok"] = False
+            _TORCH_INSTALL["msg"] = ("pip failed — see the system console. "
+                                     + tail)
+        else:
+            _TORCH_INSTALL["ok"] = True
+    except Exception as exc:
+        _TORCH_INSTALL["ok"] = False
+        _TORCH_INSTALL["msg"] = f"install failed: {exc}"
+
+
+def _redraw_preferences():
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'PREFERENCES':
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _watch_install():
+    """bpy.app.timers callback: poll the worker, then probe the result."""
+    thread = _TORCH_INSTALL["thread"]
+    if thread is not None and thread.is_alive():
+        _redraw_preferences()
+        return 0.5
+    _TORCH_INSTALL["thread"] = None
+    if _TORCH_INSTALL["ok"]:
+        if _TORCH_INSTALL["used_user"]:
+            usersite = _user_site_dir()
+            if usersite and usersite not in sys.path:
+                sys.path.append(usersite)
+        solver.reset_torch_info()
+        has_torch, cuda, mps = solver.torch_device_info()
+        if has_torch:
+            _TORCH_INSTALL["msg"] = (
+                "PyTorch installed — " + _device_summary(cuda, mps))
+        else:
+            _TORCH_INSTALL["ok"] = False
+            _TORCH_INSTALL["msg"] = ("installed, but import failed — "
+                                     "restart Blender and check again")
+    _redraw_preferences()
+    return None
+
+
+def _device_summary(cuda, mps):
+    if cuda:
+        return "CUDA GPU available"
+    if mps:
+        return "Metal GPU (MPS) available"
+    return "no GPU device available (CPU-only build or no GPU)"
+
+
+class CUBIFY_OT_probe_torch(bpy.types.Operator):
+    """Check whether PyTorch and a GPU device are available in Blender's
+    Python (imports torch, which can take a few seconds)"""
+    bl_idname = "cubify.probe_torch"
+    bl_label = "Check PyTorch"
+
+    def execute(self, context):
+        solver.reset_torch_info()
+        has_torch, cuda, mps = solver.torch_device_info()
+        if not has_torch:
+            _TORCH_INSTALL["msg"] = "PyTorch is not installed"
+        else:
+            try:
+                import torch
+                ver = torch.__version__
+            except Exception:
+                ver = "?"
+            _TORCH_INSTALL["msg"] = f"PyTorch {ver} — {_device_summary(cuda, mps)}"
+        return {'FINISHED'}
+
+
+class CUBIFY_OT_install_torch(bpy.types.Operator):
+    """Download and install PyTorch into Blender's own Python with pip.
+    Runs in the background; Blender stays usable. The GPU build is large
+    (macOS ~250 MB, Windows CUDA ~3 GB)"""
+    bl_idname = "cubify.install_torch"
+    bl_label = "Install PyTorch"
+
+    def execute(self, context):
+        if _TORCH_INSTALL["thread"] is not None:
+            self.report({'WARNING'}, "Install already running")
+            return {'CANCELLED'}
+        _TORCH_INSTALL.update(ok=None, msg="Installing… (progress in the "
+                              "system console)", used_user=False)
+        thread = threading.Thread(target=_install_torch_worker, daemon=True)
+        _TORCH_INSTALL["thread"] = thread
+        thread.start()
+        bpy.app.timers.register(_watch_install, first_interval=0.5)
+        self.report({'INFO'}, "PyTorch install started in the background")
+        return {'FINISHED'}
+
+
+class CubifyPreferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="GPU solver (PyTorch)", icon='SYSTEM')
+
+        installing = _TORCH_INSTALL["thread"] is not None
+        info = solver.torch_device_info_cached()
+        if installing:
+            box.label(text=_TORCH_INSTALL["msg"], icon='SORTTIME')
+        elif _TORCH_INSTALL["msg"]:
+            icon = 'ERROR' if _TORCH_INSTALL["ok"] is False else 'CHECKMARK'
+            box.label(text=_TORCH_INSTALL["msg"], icon=icon)
+        elif info is not None:
+            has_torch, cuda, mps = info
+            if has_torch:
+                box.label(text="PyTorch installed — " + _device_summary(cuda, mps),
+                          icon='CHECKMARK')
+            else:
+                box.label(text="PyTorch not installed (CPU solver is used)",
+                          icon='INFO')
+        else:
+            box.label(text="PyTorch not checked yet", icon='QUESTION')
+
+        row = box.row(align=True)
+        row.enabled = not installing
+        row.operator(CUBIFY_OT_probe_torch.bl_idname, icon='VIEWZOOM')
+        row.operator(CUBIFY_OT_install_torch.bl_idname, icon='IMPORT')
+
+        size = "~3 GB (CUDA build)" if sys.platform.startswith("win") else "~250 MB"
+        box.label(text=f"Optional — only speeds up meshes over ~20k vertices. "
+                       f"Download is {size}.")
+        box.label(text="Command: " + " ".join(_torch_pip_command()))
+
+
 # ================== Registration
 
 _classes = (CubifySettings, OBJECT_OT_cubify, OBJECT_OT_cubify_pins,
-            OBJECT_OT_arap_manipulate, VIEW3D_PT_cubify)
+            OBJECT_OT_arap_manipulate, VIEW3D_PT_cubify,
+            CUBIFY_OT_probe_torch, CUBIFY_OT_install_torch, CubifyPreferences)
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.cubify_settings = bpy.props.PointerProperty(type=CubifySettings)
+    # a previous session may have pip-installed torch with --user (Blender
+    # does not load the user site by default) — make it importable
+    usersite = _user_site_dir()
+    if (usersite and usersite not in sys.path
+            and os.path.isdir(os.path.join(usersite, "torch"))):
+        sys.path.append(usersite)
 
 
 def unregister():

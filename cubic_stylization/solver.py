@@ -375,6 +375,15 @@ def torch_device_info_cached():
     return _TORCH_INFO
 
 
+def reset_torch_info():
+    """Forget the cached probe so the next torch_device_info() re-imports
+    torch (used after installing torch into the running session)."""
+    global _TORCH_INFO
+    _TORCH_INFO = None
+    import importlib
+    importlib.invalidate_caches()
+
+
 def torch_device_info():
     """(torch_available, cuda_available, mps_available), cached."""
     global _TORCH_INFO

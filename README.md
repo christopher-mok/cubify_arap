@@ -37,14 +37,21 @@ The **Device** dropdown selects where the solver runs:
 - **CUDA GPU** — NVIDIA GPUs, via PyTorch.
 - **Metal GPU (MPS)** — Apple GPUs, via PyTorch.
 
-GPU devices require PyTorch inside **Blender's own Python**:
+GPU devices require PyTorch inside **Blender's own Python**. The easy way:
+**Edit → Preferences → Add-ons → Cubic Stylization → Install PyTorch** — a
+one-click background install into Blender's Python (macOS ~250 MB; Windows
+~3 GB, CUDA build). **Check PyTorch** on the same panel reports what's
+currently available. Manual alternative from a terminal:
 
 ```sh
 # macOS (Apple GPU / MPS):
 /Applications/Blender.app/Contents/Resources/<ver>/python/bin/python3.* -m pip install torch
 
-# Windows/Linux (NVIDIA / CUDA): use the CUDA wheel from pytorch.org, e.g.
-<blender>/python/bin/python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Linux (NVIDIA / CUDA — the default wheel bundles CUDA):
+<blender>/python/bin/python -m pip install torch
+
+# Windows (NVIDIA / CUDA): use the CUDA wheel index from pytorch.org, e.g.
+<blender>\python\bin\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126
 ```
 
 If PyTorch or the requested device is missing, the add-on falls back to the
