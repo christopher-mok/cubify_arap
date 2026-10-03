@@ -290,7 +290,7 @@ class TorchCubicStylizer(CubicStylizer):
                              self.t_w[m, None] * ppos_t[self.t_jj[m]])
             b[self.t_lu_anchors] = ppos_t[self.t_lu_anchors]
             b_np = b.detach().cpu().double().numpy()
-            x = np.column_stack([self._lu.solve(b_np[:, c]) for c in range(3)])
+            x = self._lu.solve(np.ascontiguousarray(b_np))
             return torch.as_tensor(x, dtype=self.dt, device=self.dev)
 
         if len(self._cg_anchors):

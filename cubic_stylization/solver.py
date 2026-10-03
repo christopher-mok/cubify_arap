@@ -24,6 +24,14 @@ try:
 except Exception:
     _HAS_SCIPY = False
 
+def _det3(X):
+    """Batched closed-form 3x3 determinant — much faster than the LAPACK
+    round-trip of np.linalg.det on large (n, 3, 3) stacks."""
+    return (X[:, 0, 0] * (X[:, 1, 1] * X[:, 2, 2] - X[:, 1, 2] * X[:, 2, 1])
+            - X[:, 0, 1] * (X[:, 1, 0] * X[:, 2, 2] - X[:, 1, 2] * X[:, 2, 0])
+            + X[:, 0, 2] * (X[:, 1, 0] * X[:, 2, 1] - X[:, 1, 1] * X[:, 2, 0]))
+
+
 # ADMM constants from the paper
 _RHO_INIT = 1e-4
 _MU = 10.0
@@ -101,6 +109,15 @@ class CubicStylizer:
         self.w = np.concatenate([w, w])
         self.e0 = V[self.ii] - V[self.jj]           # rest-pose edge vectors
         self.deg = np.bincount(self.ii, weights=self.w, minlength=n)
+
+        # weighted edge->vertex accumulator: (acc @ X)[i] = sum_e w_e X_e over
+        # edges leaving i. One C sparse matmul replaces a python loop of
+        # bincounts in the per-iteration S and rhs assemblies.
+        self._acc = None
+        if _HAS_SCIPY:
+            E = len(self.ii)
+            self._acc = csr_matrix(
+                (self.w, (self.ii, np.arange(E))), shape=(n, E))
 
     def _build_normals_and_areas(self):
         V, F, n = self.V0, self.F, self.n
@@ -215,17 +232,22 @@ class CubicStylizer:
 
         # ARAP covariance S_i = sum_j w_ij d_ij d'_ij^T over the one-ring
         Ep = V[self.ii] - V[self.jj]
-        S = np.zeros((n, 3, 3))
-        for a in range(3):
-            for b in range(3):
-                S[:, a, b] = np.bincount(
-                    self.ii, weights=self.w * self.e0[:, a] * Ep[:, b], minlength=n)
+        if self._acc is not None:
+            outer = (self.e0[:, :, None] * Ep[:, None, :]).reshape(-1, 9)
+            S = (self._acc @ outer).reshape(n, 3, 3)
+        else:
+            S = np.zeros((n, 3, 3))
+            for a in range(3):
+                for b in range(3):
+                    S[:, a, b] = np.bincount(
+                        self.ii, weights=self.w * self.e0[:, a] * Ep[:, b],
+                        minlength=n)
 
         if self.lam <= 0.0:
             # classic ARAP: plain orthogonal Procrustes, no ADMM needed
             U, _, Vt = np.linalg.svd(S)
             R = Vt.transpose(0, 2, 1) @ U.transpose(0, 2, 1)
-            flip = np.linalg.det(R) < 0
+            flip = _det3(R) < 0
             if np.any(flip):
                 Uf = U[flip]
                 Uf[:, :, 2] *= -1
@@ -246,7 +268,7 @@ class CubicStylizer:
             M = S[act] + rc[:, None, None] * (nh[:, :, None] @ Azu[:, None, :])
             U, _, Vt = np.linalg.svd(M)
             R = Vt.transpose(0, 2, 1) @ U.transpose(0, 2, 1)
-            flip = np.linalg.det(R) < 0
+            flip = _det3(R) < 0
             if np.any(flip):
                 Uf = U[flip]
                 Uf[:, :, 2] *= -1
@@ -291,10 +313,13 @@ class CubicStylizer:
         vertices are read)."""
         n = self.n
         Rsum = R[self.ii] + R[self.jj]
-        contrib = 0.5 * self.w[:, None] * np.einsum('eij,ej->ei', Rsum, self.e0)
-        b = np.zeros((n, 3))
-        for c in range(3):
-            b[:, c] = np.bincount(self.ii, weights=contrib[:, c], minlength=n)
+        if self._acc is not None:
+            b = self._acc @ (0.5 * np.einsum('eij,ej->ei', Rsum, self.e0))
+        else:
+            contrib = 0.5 * self.w[:, None] * np.einsum('eij,ej->ei', Rsum, self.e0)
+            b = np.zeros((n, 3))
+            for c in range(3):
+                b[:, c] = np.bincount(self.ii, weights=contrib[:, c], minlength=n)
 
         if self._lu is not None:
             m = self._lu_edge_to_anchor
@@ -303,7 +328,7 @@ class CubicStylizer:
                 for c in range(3):
                     b[:, c] += np.bincount(self.ii[m], weights=pc[:, c], minlength=n)
             b[self._lu_anchors] = ppos[self._lu_anchors]
-            return np.column_stack([self._lu.solve(b[:, c]) for c in range(3)])
+            return self._lu.solve(b)
 
         if len(self._cg_anchors):
             m = self._cg_edge_to_anchor
