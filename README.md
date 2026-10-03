@@ -89,6 +89,46 @@ benchmarked on this machine.
 3. Click **Cubify Mesh** (undo-supported). Pinned vertices, if any, are held
    in place during stylization.
 
+## Style as Process (animation bake)
+
+Bake the cubification *process* itself as an animation: **Style as Process →
+Bake Animation (Shape Keys)**. One absolute shape key is stored per step and
+played across the timeline via a keyframed **Evaluation Time** (two linear
+keyframes starting at the current frame) — scrub, retime, or ease it like any
+f-curve. The base mesh, topology and UVs are untouched; delete the shape keys
+to recover the original. Pinned vertices are held throughout.
+
+- **Animate By**:
+  - **Cubeness Ramp** (default) — λ ramps from 0 to the current Cubeness with
+    a few warm-started iterations per step (**Iterations / Step**). Evenly
+    paced; reads as a crystallization spreading at constant speed. Raise
+    Iterations / Step if the final frames look unconverged.
+  - **Iterations** — one solver iteration per step at full Cubeness: the raw
+    convergence, where flat regions snap into place early and creases sharpen
+    late (most of the change happens in the first frames).
+- **Steps** — number of baked shape keys; **Frame Step** — timeline frames
+  between them.
+
+Meshes that already have shape keys are skipped (the bake would fight them).
+
+### Cubify Every Frame (to Copy)
+
+For an *animated* mesh (object transforms, shape keys, armatures, deforming
+modifiers), **Cubify Every Frame (to Copy)** re-cubifies the evaluated
+world-space mesh at every sampled frame of the scene range (**Frame Step**
+sets the sampling) and bakes the results onto a **new** object named
+`<name>_cubified_anim` — one absolute shape key per sampled frame, played
+back via keyframed Evaluation Time. The original object and its animation
+are untouched.
+
+Because the solve is in world space with fixed cube axes, a rotating mesh
+re-crystallizes against the world frame as it turns. Each frame is
+warm-started from the previous one for temporal coherence, and the solver's
+convergence early-out keeps per-frame cost down. Pins are honored when no
+modifier changes the vertex count; animated topology-changing modifiers are
+not supported. The copy sits at the world origin (identity transform) since
+world space is baked into its keys.
+
 ## ARAP Manipulation
 
 1. In Edit Mode, select the vertices you want as handles/anchors, then in the

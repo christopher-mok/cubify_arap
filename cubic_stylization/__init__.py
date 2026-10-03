@@ -122,6 +122,33 @@ class CubifySettings(bpy.types.PropertyGroup):
         description="Local-global iterations per mouse move while dragging "
                     "(higher is stiffer/more converged but slower)",
         default=2, min=1, max=20)
+    anim_mode: bpy.props.EnumProperty(
+        name="Animate By",
+        description="What advances from one baked step to the next",
+        items=[
+            ('LAMBDA', "Cubeness Ramp",
+             "Ramp Cubeness from 0 to its current value with a few "
+             "warm-started iterations per step — evenly paced, eased "
+             "transformation"),
+            ('ITER', "Iterations",
+             "One solver iteration per step at full Cubeness — the raw "
+             "convergence: flat regions snap first, creases sharpen late"),
+        ], default='LAMBDA')
+    anim_samples: bpy.props.IntProperty(
+        name="Steps",
+        description="Number of baked steps (one shape key each)",
+        default=20, min=2, max=200)
+    anim_iters: bpy.props.IntProperty(
+        name="Iterations / Step",
+        description="Warm-started solver iterations per step (Cubeness Ramp "
+                    "mode). Raise it if the final frames look unconverged",
+        default=3, min=1, max=50)
+    anim_frame_step: bpy.props.IntProperty(
+        name="Frame Step",
+        description="Timeline frames between baked steps. Style-as-process "
+                    "bakes start at the current frame; Cubify Every Frame "
+                    "samples the scene frame range at this step",
+        default=2, min=1, max=50)
     device: bpy.props.EnumProperty(
         name="Device",
         description="Where the solver runs. GPU devices need PyTorch installed "
@@ -228,6 +255,254 @@ class OBJECT_OT_cubify(bpy.types.Operator):
                     f"{time.time() - t0:.2f}s on {device} "
                     f"(lambda={props.cubeness:.2f}{note})")
         return True
+
+
+# ================== Style-as-process animation bake
+
+class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
+    """Bake the cubification process as an animation over the timeline:
+    one absolute shape key per step, driven by keyframed Evaluation Time.
+    The base mesh, topology and UVs are untouched — delete the shape keys
+    to get the original back"""
+    bl_idname = "object.cubify_bake_animation"
+    bl_label = "Bake Animation (Shape Keys)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
+
+    def execute(self, context):
+        props = context.scene.cubify_settings
+        if props.cubeness <= 0.0:
+            self.report({'ERROR'}, "Cubeness is 0 — nothing to animate")
+            return {'CANCELLED'}
+        targets = [ob for ob in context.selected_objects if ob.type == 'MESH']
+        if not targets and context.active_object and context.active_object.type == 'MESH':
+            targets = [context.active_object]
+        if not targets:
+            self.report({'ERROR'}, "Select at least one mesh object")
+            return {'CANCELLED'}
+
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        done = 0
+        try:
+            for ob in targets:
+                ok = self._bake_object(context, ob, props,
+                                       base=done / len(targets),
+                                       span=1.0 / len(targets))
+                if ok:
+                    done += 1
+        finally:
+            wm.progress_end()
+
+        if done == 0:
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+    def _bake_object(self, context, ob, props, base, span):
+        me = ob.data
+        if me.shape_keys is not None:
+            self.report({'WARNING'}, f"{ob.name}: skipped (already has shape keys)")
+            return False
+        if len(me.polygons) == 0:
+            self.report({'WARNING'}, f"{ob.name}: skipped (no faces)")
+            return False
+
+        V0, F = read_mesh_arrays(me)
+        pins = get_pin_indices(ob)
+        A = np.array(Euler(props.orientation, 'XYZ').to_matrix(), dtype=np.float64)
+
+        try:
+            stylizer, device, warn = solver.create_stylizer(
+                V0, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
+                device=props.device)
+            if warn:
+                self.report({'WARNING'}, f"{ob.name}: {warn}")
+        except Exception as exc:
+            self.report({'ERROR'}, f"{ob.name}: solver setup failed ({exc})")
+            return False
+
+        # Basis = untouched original; every step is its own absolute key.
+        # Only shape-key point positions are written: base mesh vertices,
+        # topology, UVs and all loop data stay exactly as they are.
+        ob.shape_key_add(name="Basis", from_mix=False)
+        key = me.shape_keys
+        key.use_relative = False
+
+        wm = context.window_manager
+        steps = props.anim_samples
+        V = V0.copy()
+        t0 = time.time()
+        for k in range(1, steps + 1):
+            if props.anim_mode == 'LAMBDA':
+                stylizer.lam = props.cubeness * k / steps
+                iters = props.anim_iters
+            else:
+                iters = 1
+            try:
+                V = stylizer.solve(V_init=V, iterations=iters,
+                                   admm_iters=props.admm_iterations)
+            except Exception as exc:
+                self.report({'ERROR'}, f"{ob.name}: solver failed at step {k} ({exc})")
+                return False
+            if not np.all(np.isfinite(V)):
+                self.report({'ERROR'}, f"{ob.name}: invalid positions at step {k}")
+                return False
+            kb = ob.shape_key_add(name=f"Cubify {k:03d}", from_mix=False)
+            kb.interpolation = 'KEY_LINEAR'
+            kb.data.foreach_set("co", np.asarray(V, dtype=np.float32).ravel())
+            wm.progress_update(int(100 * (base + span * k / steps)))
+
+        # Play the key sequence across the timeline: eval_time runs linearly
+        # from the Basis key's position to the last key's.
+        f0 = context.scene.frame_current
+        f1 = f0 + steps * props.anim_frame_step
+        key.eval_time = key.key_blocks[0].frame
+        key.keyframe_insert(data_path="eval_time", frame=f0)
+        key.eval_time = key.key_blocks[-1].frame
+        key.keyframe_insert(data_path="eval_time", frame=f1)
+        if key.animation_data and key.animation_data.action:
+            for fc in key.animation_data.action.fcurves:
+                if fc.data_path == "eval_time":
+                    for kp in fc.keyframe_points:
+                        kp.interpolation = 'LINEAR'
+
+        mode = ("cubeness ramp" if props.anim_mode == 'LAMBDA'
+                else "iterations")
+        self.report({'INFO'},
+                    f"{ob.name}: baked {steps} steps ({mode}) over frames "
+                    f"{f0}-{f1} in {time.time() - t0:.2f}s on {device}")
+        return True
+
+
+class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
+    """Cubify the animated mesh at every sampled frame of the scene range
+    and bake the results onto a NEW copy object as shape keys over the
+    timeline. The copy follows the original's animation (object transforms,
+    shape keys, armatures, deforming modifiers — evaluated in world space)
+    with each frame re-cubified; the original is untouched"""
+    bl_idname = "object.cubify_bake_frames"
+    bl_label = "Cubify Every Frame (to Copy)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
+
+    def execute(self, context):
+        props = context.scene.cubify_settings
+        if props.cubeness <= 0.0:
+            self.report({'ERROR'}, "Cubeness is 0 — nothing to cubify")
+            return {'CANCELLED'}
+        ob = context.active_object
+        scene = context.scene
+        frames = list(range(scene.frame_start, scene.frame_end + 1,
+                            props.anim_frame_step))
+        if frames[-1] != scene.frame_end:
+            frames.append(scene.frame_end)
+
+        frame_restore = scene.frame_current
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        new_ob = None
+        try:
+            # ---- setup from the first sampled frame
+            scene.frame_set(frames[0])
+            dg = context.evaluated_depsgraph_get()
+            ob_eval = ob.evaluated_get(dg)
+            me0 = bpy.data.meshes.new_from_object(
+                ob_eval, preserve_all_data_layers=True, depsgraph=dg)
+            n = len(me0.vertices)
+            if n == 0 or len(me0.polygons) == 0:
+                bpy.data.meshes.remove(me0)
+                self.report({'ERROR'}, f"{ob.name}: evaluated mesh has no geometry")
+                return {'CANCELLED'}
+            _, F = read_mesh_arrays(me0)
+
+            # pins only translate to the evaluated mesh when no modifier
+            # changed the vertex count/order
+            pins = []
+            if n == len(ob.data.vertices):
+                pins = get_pin_indices(ob)
+            elif get_pin_indices(ob):
+                self.report({'WARNING'},
+                            f"{ob.name}: pins ignored (modifiers change the "
+                            "vertex count)")
+
+            A = np.array(Euler(props.orientation, 'XYZ').to_matrix(),
+                         dtype=np.float64)
+
+            new_ob = bpy.data.objects.new(ob.name + "_cubified_anim", me0)
+            context.collection.objects.link(new_ob)
+            # world space is baked into the keys; the copy stays at identity
+            new_ob.shape_key_add(name="Basis", from_mix=False)
+            key = me0.shape_keys
+            key.use_relative = False
+
+            # ---- per-frame solve, warm-started from the previous frame
+            V_prev = None
+            device = warned = None
+            t0 = time.time()
+            for i, f in enumerate(frames):
+                scene.frame_set(f)
+                dg = context.evaluated_depsgraph_get()
+                ob_eval = ob.evaluated_get(dg)
+                me_ev = ob_eval.data
+                if len(me_ev.vertices) != n:
+                    raise RuntimeError(
+                        f"vertex count changed at frame {f} "
+                        f"({len(me_ev.vertices)} vs {n}) — animated "
+                        "topology-changing modifiers are not supported")
+                V = np.empty(n * 3, dtype=np.float64)
+                me_ev.vertices.foreach_get("co", V)
+                M = np.array(ob_eval.matrix_world, dtype=np.float64)
+                Vw = V.reshape(-1, 3) @ M[:3, :3].T + M[:3, 3]
+
+                stylizer, device, warn = solver.create_stylizer(
+                    Vw, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
+                    device=props.device)
+                if warn and not warned:
+                    self.report({'WARNING'}, f"{ob.name}: {warn}")
+                    warned = True
+                V_out = stylizer.solve(V_init=V_prev,
+                                       iterations=props.iterations,
+                                       admm_iters=props.admm_iterations)
+                if not np.all(np.isfinite(V_out)):
+                    raise RuntimeError(f"invalid positions at frame {f}")
+                V_prev = V_out
+
+                kb = new_ob.shape_key_add(name=f"Frame {f:04d}", from_mix=False)
+                kb.interpolation = 'KEY_LINEAR'
+                kb.data.foreach_set("co", np.asarray(V_out, dtype=np.float32).ravel())
+                key.eval_time = kb.frame
+                key.keyframe_insert(data_path="eval_time", frame=f)
+                wm.progress_update(int(100 * (i + 1) / len(frames)))
+
+            if key.animation_data and key.animation_data.action:
+                for fc in key.animation_data.action.fcurves:
+                    if fc.data_path == "eval_time":
+                        for kp in fc.keyframe_points:
+                            kp.interpolation = 'LINEAR'
+
+            self.report({'INFO'},
+                        f"{new_ob.name}: {len(frames)} frames "
+                        f"({frames[0]}-{frames[-1]}, step {props.anim_frame_step}) "
+                        f"in {time.time() - t0:.2f}s on {device}")
+            return {'FINISHED'}
+        except Exception as exc:
+            if new_ob is not None:
+                me = new_ob.data
+                bpy.data.objects.remove(new_ob)
+                bpy.data.meshes.remove(me)
+            self.report({'ERROR'}, f"{ob.name}: {exc}")
+            return {'CANCELLED'}
+        finally:
+            scene.frame_set(frame_restore)
+            wm.progress_end()
 
 
 # ================== Pin management
@@ -514,6 +789,19 @@ class VIEW3D_PT_cubify(bpy.types.Panel):
 
         layout.separator()
         box = layout.box()
+        box.label(text="Style as Process", icon='SHAPEKEY_DATA')
+        row = box.row(align=True)
+        row.prop(props, "anim_mode", expand=True)
+        col = box.column(align=True)
+        col.prop(props, "anim_samples")
+        if props.anim_mode == 'LAMBDA':
+            col.prop(props, "anim_iters")
+        col.prop(props, "anim_frame_step")
+        box.operator(OBJECT_OT_cubify_bake_anim.bl_idname, icon='RENDER_ANIMATION')
+        box.operator(OBJECT_OT_cubify_bake_frames.bl_idname, icon='DUPLICATE')
+
+        layout.separator()
+        box = layout.box()
         box.label(text="ARAP Manipulation", icon='VIEW_PAN')
         row = box.row(align=True)
         op = row.operator(OBJECT_OT_cubify_pins.bl_idname, text="Set Pins")
@@ -711,7 +999,8 @@ class CubifyPreferences(bpy.types.AddonPreferences):
 
 # ================== Registration
 
-_classes = (CubifySettings, OBJECT_OT_cubify, OBJECT_OT_cubify_pins,
+_classes = (CubifySettings, OBJECT_OT_cubify, OBJECT_OT_cubify_bake_anim,
+            OBJECT_OT_cubify_bake_frames, OBJECT_OT_cubify_pins,
             OBJECT_OT_arap_manipulate, VIEW3D_PT_cubify,
             CUBIFY_OT_probe_torch, CUBIFY_OT_install_torch, CubifyPreferences)
 
