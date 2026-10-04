@@ -1,0 +1,108 @@
+name: build cpp addon
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths:
+      - "cubic_stylization_c++/**"
+      - ".github/workflows/build-cpp.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact: cubify_server-macos
+            built: bin/cubify_server
+            cmake_flags: "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          - os: ubuntu-22.04 # oldest LTS runner = oldest glibc baseline
+            artifact: cubify_server-linux
+            built: bin/cubify_server
+            cmake_flags: ""
+          - os: windows-2022
+            artifact: cubify_server.exe
+            built: bin/cubify_server.exe
+            cmake_flags: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        working-directory: cubic_stylization_c++
+        run: cmake -S src -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_flags }}
+
+      - name: Build
+        working-directory: cubic_stylization_c++
+        run: cmake --build build --config Release --parallel
+
+      - name: Selftest
+        working-directory: cubic_stylization_c++
+        run: ./${{ matrix.built }} --selftest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python tests (drive the server over the wire protocol)
+        working-directory: cubic_stylization_c++
+        run: |
+          python -m pip install --quiet numpy
+          python tests/test_parts_and_flat.py
+          python tests/test_thin_walls.py
+
+      - name: Rename to platform binary
+        working-directory: cubic_stylization_c++
+        run: |
+          if [ "${{ matrix.built }}" != "bin/${{ matrix.artifact }}" ]; then
+            mv "${{ matrix.built }}" "bin/${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: cubic_stylization_c++/bin/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: cubic_stylization_c++/bin
+          merge-multiple: true
+
+      - name: Package all-in-one zip
+        working-directory: cubic_stylization_c++
+        run: |
+          chmod +x bin/cubify_server-macos bin/cubify_server-linux
+          ls -la bin/
+          python builder.py --zip-only
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cubic_stylization_c++-all-platforms
+          path: cubic_stylization_c++.zip
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" cubic_stylization_c++.zip --clobber ||
+          gh release create "$GITHUB_REF_NAME" cubic_stylization_c++.zip \
+            --title "$GITHUB_REF_NAME" --generate-notes

@@ -30,15 +30,33 @@ FLAG_WARM_LAST = 1 << 4
 _HEADER = struct.Struct("<IIQ")
 
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
-EXE_NAME = "cubify_server.exe" if sys.platform.startswith("win") else "cubify_server"
+
+# A locally built `cubify_server` wins over the per-platform binary bundled
+# in the all-in-one zip (cubify_server-macos is a universal2 build).
+if sys.platform.startswith("win"):
+    _EXE_NAMES = ("cubify_server.exe",)
+elif sys.platform == "darwin":
+    _EXE_NAMES = ("cubify_server", "cubify_server-macos")
+else:
+    _EXE_NAMES = ("cubify_server", "cubify_server-linux")
+EXE_NAME = _EXE_NAMES[0]
 
 
 class ServerError(RuntimeError):
     pass
 
 
+def _first_existing(directory):
+    for name in _EXE_NAMES:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def default_server_path():
-    return os.path.join(ADDON_DIR, "bin", EXE_NAME)
+    bindir = os.path.join(ADDON_DIR, "bin")
+    return _first_existing(bindir) or os.path.join(bindir, EXE_NAME)
 
 
 def resolve_server_path(override=""):
@@ -46,7 +64,7 @@ def resolve_server_path(override=""):
     if override:
         path = os.path.abspath(os.path.expanduser(override))
         if os.path.isdir(path):
-            path = os.path.join(path, EXE_NAME)
+            path = _first_existing(path) or os.path.join(path, EXE_NAME)
         return path
     return default_server_path()
 
@@ -61,6 +79,13 @@ class Server:
         if not os.path.isfile(path):
             raise ServerError(f"C++ server not found at {path} — build it from "
                               "the add-on preferences (Build Server)")
+        if not sys.platform.startswith("win") and not os.access(path, os.X_OK):
+            # Blender installs add-ons with python's zipfile, which drops
+            # the unix exec bit — restore it
+            try:
+                os.chmod(path, 0o755)
+            except OSError:
+                pass
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             self.proc = subprocess.Popen(

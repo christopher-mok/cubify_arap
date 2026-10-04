@@ -56,20 +56,63 @@ def find_cmake():
     return None
 
 
-def build_commands(cmake):
+def build_commands(cmake, universal=False):
+    configure = [cmake, "-S", SRC_DIR, "-B", BUILD_DIR, "-DCMAKE_BUILD_TYPE=Release"]
+    if universal and sys.platform == "darwin":
+        configure.append("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64")
     return [
-        [cmake, "-S", SRC_DIR, "-B", BUILD_DIR, "-DCMAKE_BUILD_TYPE=Release"],
+        configure,
         [cmake, "--build", BUILD_DIR, "--config", "Release", "--parallel"],
     ]
 
 
-def build(log=print):
+def _find_compiler():
+    for name in ("clang++", "g++", "c++"):
+        exe = shutil.which(name)
+        if exe:
+            return exe
+    return None
+
+
+def _find_eigen():
+    for cand in ("/opt/homebrew/include/eigen3", "/usr/local/include/eigen3",
+                 "/usr/include/eigen3"):
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def direct_build_commands(universal=False):
+    """CMake-free fallback (macOS/Linux): one compiler invocation against an
+    installed Eigen. Returns None when compiler or Eigen is missing."""
+    if sys.platform.startswith("win"):
+        return None
+    cxx, eigen = _find_compiler(), _find_eigen()
+    if cxx is None or eigen is None:
+        return None
+    cmd = [cxx, "-std=c++17", "-O3", "-DNDEBUG", "-Wall", "-pthread",
+           "-I", eigen,
+           os.path.join(SRC_DIR, "server.cpp"),
+           os.path.join(SRC_DIR, "cubic_stylizer.cpp"),
+           os.path.join(SRC_DIR, "thin_walls.cpp"),
+           "-o", os.path.join(BIN_DIR, "cubify_server")]
+    if universal and sys.platform == "darwin":
+        cmd += ["-arch", "arm64", "-arch", "x86_64"]
+    return [cmd]
+
+
+def build(log=print, universal=False):
     """Configure + build. Returns (ok, message); full output goes to log()."""
     cmake = find_cmake()
     if cmake is None:
-        return False, ("CMake not found — install CMake (and a C++ compiler) "
-                       "or build manually, see README")
-    for cmd in build_commands(cmake):
+        cmds = direct_build_commands(universal=universal)
+        if cmds is None:
+            return False, ("CMake not found — install CMake (and a C++ "
+                           "compiler) or build manually, see README")
+        os.makedirs(BIN_DIR, exist_ok=True)
+    else:
+        cmds = build_commands(cmake, universal=universal)
+    for cmd in cmds:
         log("$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
         try:
             proc = subprocess.run(cmd, stdout=subprocess.PIPE,
@@ -103,10 +146,16 @@ def package(zip_path=None):
 
 
 if __name__ == "__main__":
-    # python builder.py          build the server into bin/
-    # python builder.py --zip    build, then package the add-on zip
-    ok, msg = build()
+    # python builder.py              build the server into bin/
+    # python builder.py --universal  macOS: build arm64 + x86_64 universal2
+    # python builder.py --zip        build, then package the add-on zip
+    # python builder.py --zip-only   package without building
+    args = sys.argv[1:]
+    if "--zip-only" in args:
+        print("packaged", package())
+        sys.exit(0)
+    ok, msg = build(universal="--universal" in args)
     print(msg)
-    if ok and "--zip" in sys.argv[1:]:
+    if ok and "--zip" in args:
         print("packaged", package())
     sys.exit(0 if ok else 1)

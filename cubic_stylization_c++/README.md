@@ -20,8 +20,12 @@ at 41k.
 
 ## Install
 
-1. Build the server once (below), or use a zip that already contains
-   `bin/cubify_server(.exe)` for your platform.
+1. Use the all-in-one zip (it bundles server binaries for every platform:
+   `cubify_server.exe` for Windows, `cubify_server-macos` as a
+   universal2 arm64+x86_64 build, `cubify_server-linux`; the add-on
+   launches the one matching your OS) — or build the server once (below).
+   CI (`.github/workflows/build-cpp.yml`) builds all three and assembles
+   the zip on every push; tagged `v*` releases get it attached.
 2. **Edit → Preferences → Add-ons → Install…**, pick
    `cubic_stylization_c++.zip`, enable **Mesh: Cubic Stylization (C++)**.
 3. Tools are in the 3D Viewport sidebar (**N**) → **Cubify C++** tab.
@@ -42,7 +46,9 @@ downloaded automatically on the first build (or pass
   background (log in the system console). On Windows the CMake bundled with
   Visual Studio is found automatically.
 - **From a terminal**: `python builder.py` in this folder
-  (`python builder.py --zip` also writes `../cubic_stylization_c++.zip`).
+  (`python builder.py --zip` also writes `../cubic_stylization_c++.zip`;
+  `--universal` builds macOS arm64+x86_64). Without CMake, macOS/Linux
+  fall back to a direct clang++/g++ build against an installed Eigen.
 - **Manually**: `cmake -S src -B build && cmake --build build --config Release`.
 
 The executable is written to `bin/`. It has no runtime dependencies (static
