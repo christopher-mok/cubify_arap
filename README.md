@@ -121,10 +121,20 @@ sets the sampling) and bakes the results onto a **new** object named
 back via keyframed Evaluation Time. The original object and its animation
 are untouched.
 
-Because the solve is in world space with fixed cube axes, a rotating mesh
-re-crystallizes against the world frame as it turns. Each frame is
-warm-started from the previous one for temporal coherence, and the solver's
-convergence early-out keeps per-frame cost down. Pins are honored when no
+**Cube Axes** sets what the cube axes are attached to:
+
+- **Object** (default) — the axes turn with the object (its world rotation
+  times **Cube Orientation**), so a rotating object bakes as a rotating
+  cubified shape, and deformations are re-cubified against the object's
+  own frame.
+- **World** — the axes stay fixed in the world, so a rotating object
+  re-crystallizes against the world axes as it turns: the flat faces keep
+  facing the same world directions while the surface rotates underneath.
+
+Each frame is warm-started from the previous one, carried along by the
+best-fit motion of the rest pose (so object and armature rotations are
+followed), for temporal coherence; the solver's convergence early-out keeps
+per-frame cost down. Pins are honored when no
 modifier changes the vertex count; animated topology-changing modifiers are
 not supported. The copy sits at the world origin (identity transform) since
 world space is baked into its keys.

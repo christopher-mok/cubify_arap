@@ -159,6 +159,30 @@ def cube_axes(props):
     return np.array(Euler(props.orientation, 'XYZ').to_matrix(), dtype=np.float64)
 
 
+def rotation_part(M):
+    """Nearest proper rotation to the 3x3 part of a 4x4 matrix (drops
+    scale and shear)."""
+    U, _, Vt = np.linalg.svd(np.asarray(M, dtype=np.float64)[:3, :3])
+    if np.linalg.det(U @ Vt) < 0:
+        U[:, 2] *= -1
+    return U @ Vt
+
+
+def similarity_align(src, dst):
+    """Scale s, rotation R, translation t best mapping the points src onto
+    dst (same vertex order), so that dst ~ s * src @ R.T + t (Umeyama)."""
+    mu_s, mu_d = src.mean(axis=0), dst.mean(axis=0)
+    xs, xd = src - mu_s, dst - mu_d
+    U, S, Vt = np.linalg.svd(xd.T @ xs)
+    d = np.ones(3)
+    if np.linalg.det(U @ Vt) < 0:
+        d[2] = -1.0
+    R = (U * d) @ Vt
+    var = float((xs ** 2).sum())
+    s = float((S * d).sum()) / var if var > 1e-30 else 1.0
+    return s, R, mu_d - s * (R @ mu_s)
+
+
 # ================== Settings
 
 class CubifyCppSettings(bpy.types.PropertyGroup):
@@ -228,6 +252,17 @@ class CubifyCppSettings(bpy.types.PropertyGroup):
                     "bakes start at the current frame; Cubify Every Frame "
                     "samples the scene frame range at this step",
         default=2, min=1, max=50)
+    anim_axes: bpy.props.EnumProperty(
+        name="Cube Axes",
+        description="What the cube axes are attached to in Cubify Every Frame",
+        items=[
+            ('OBJECT', "Object",
+             "Cube axes turn with the object: a rotating object bakes as a "
+             "rotating cubified shape"),
+            ('WORLD', "World",
+             "Cube axes stay fixed in the world: a rotating object "
+             "re-crystallizes against the world axes as it turns"),
+        ], default='OBJECT')
     square_flat: bpy.props.BoolProperty(
         name="Square Flat Regions",
         description="Let surfaces that already face a cube axis (lids, plates, "
@@ -625,8 +660,7 @@ class OBJECT_OT_cubify_cpp_bake_frames(bpy.types.Operator):
             key.use_relative = False
 
             # ---- per-frame solve, warm-started from the previous frame
-            V_prev = None
-            M_prev = None
+            V_prev = Vw_prev = None
             device = None
             t0 = time.time()
             for i, f in enumerate(frames):
@@ -644,29 +678,28 @@ class OBJECT_OT_cubify_cpp_bake_frames(bpy.types.Operator):
                 M = np.array(ob_eval.matrix_world, dtype=np.float64)
                 Vw = V.reshape(-1, 3) @ M[:3, :3].T + M[:3, 3]
 
-                # Warm-start through the object's delta transform. ARAP is
-                # invariant under a global rotation of the output, so a
-                # warm start left in the previous frame's pose would pin
-                # the orientation there (the mesh would stop rotating).
+                A_f = rotation_part(M) @ A if props.anim_axes == 'OBJECT' else A
+
+                # ARAP is invariant under a global rotation of the output,
+                # so a warm start left in the previous frame's orientation
+                # would keep the result there. Carry it along by however
+                # the rest pose moved (object transform, armature, ...).
                 V_init = None
                 if V_prev is not None:
-                    try:
-                        delta = M @ np.linalg.inv(M_prev)
-                        V_init = V_prev @ delta[:3, :3].T + delta[:3, 3]
-                    except np.linalg.LinAlgError:
-                        V_init = V_prev
+                    s, R, t = similarity_align(Vw_prev, Vw)
+                    V_init = s * V_prev @ R.T + t
 
                 # the rest pose changes every frame, so each frame needs its
                 # own system (cotan weights depend on it)
                 stylizer, device, _ = create_stylizer(context, Vw, F, props.cubeness,
-                                                      A, pins)
+                                                      A_f, pins)
                 with stylizer:
                     V_out = stylizer.solve(V_init=V_init,
                                            iterations=props.iterations,
                                            admm_iters=props.admm_iterations)
                 if not np.all(np.isfinite(V_out)):
                     raise RuntimeError(f"invalid positions at frame {f}")
-                V_prev, M_prev = V_out, M  # warm start from the unfixed solve
+                V_prev, Vw_prev = V_out, Vw  # warm start from the unfixed solve
                 if props.auto_fix_walls:
                     V_out, _ = fix_walls(context, Vw, V_out, F)
 
@@ -994,6 +1027,7 @@ class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
             col.prop(props, "anim_iters")
         col.prop(props, "anim_frame_step")
         box.operator(OBJECT_OT_cubify_cpp_bake_anim.bl_idname, icon='RENDER_ANIMATION')
+        box.prop(props, "anim_axes")
         box.operator(OBJECT_OT_cubify_cpp_bake_frames.bl_idname, icon='DUPLICATE')
 
         layout.separator()

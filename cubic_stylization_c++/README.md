@@ -83,7 +83,8 @@ Identical to the Python add-on (see its README), with these changes:
 
 Everything else — Cubeness, Cube Orientation, Iterations / ADMM
 Iterations, Apply to Copy, Style as Process (Cubeness Ramp / Iterations,
-Steps, Iterations / Step, Frame Step), Cubify Every Frame (to Copy), Set /
+Steps, Iterations / Step, Frame Step), Cubify Every Frame (to Copy) with
+its Cube Axes option (Object / World), Set /
 Add / Clear Pins, Stylized Drag, Drag Iterations, Start Manipulation — works
 the same way.
 
