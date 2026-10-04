@@ -40,6 +40,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install CMake (macOS runners no longer bundle it)
+        if: runner.os == 'macOS'
+        run: command -v cmake || brew install cmake
+
       - name: Configure
         working-directory: cubic_stylization_c++
         run: cmake -S src -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_flags }}
