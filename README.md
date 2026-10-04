@@ -128,13 +128,17 @@ are untouched.
   cubified shape, and deformations are re-cubified against the object's
   own frame.
 - **World** — the axes stay fixed in the world, so a rotating object
-  re-crystallizes against the world axes as it turns: the flat faces keep
-  facing the same world directions while the surface rotates underneath.
+  re-crystallizes against the world axes as it turns: the shape turns with
+  the animation while its flat faces keep facing the same world directions.
+  Like Cubify Mesh on a posed object, the cube term also pulls the shape
+  partway toward the nearest axis-aligned heading.
 
-Each frame is warm-started from the previous one, carried along by the
-best-fit motion of the rest pose (so object and armature rotations are
-followed), for temporal coherence; the solver's convergence early-out keeps
-per-frame cost down. Pins are honored when no
+Every sampled frame is an independent cubification of that frame's pose
+(exactly what Cubify Mesh would give on it), with the same Iterations
+budget. Frames are deliberately not warm-started from each other: ARAP
+leaves the output's global rotation free, so starting from the previous
+result lets the cube term turn the shape back to its earlier orientation
+and the bake stops following the animation. Pins are honored when no
 modifier changes the vertex count; animated topology-changing modifiers are
 not supported. The copy sits at the world origin (identity transform) since
 world space is baked into its keys.

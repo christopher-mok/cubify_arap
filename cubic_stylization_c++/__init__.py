@@ -168,21 +168,6 @@ def rotation_part(M):
     return U @ Vt
 
 
-def similarity_align(src, dst):
-    """Scale s, rotation R, translation t best mapping the points src onto
-    dst (same vertex order), so that dst ~ s * src @ R.T + t (Umeyama)."""
-    mu_s, mu_d = src.mean(axis=0), dst.mean(axis=0)
-    xs, xd = src - mu_s, dst - mu_d
-    U, S, Vt = np.linalg.svd(xd.T @ xs)
-    d = np.ones(3)
-    if np.linalg.det(U @ Vt) < 0:
-        d[2] = -1.0
-    R = (U * d) @ Vt
-    var = float((xs ** 2).sum())
-    s = float((S * d).sum()) / var if var > 1e-30 else 1.0
-    return s, R, mu_d - s * (R @ mu_s)
-
-
 # ================== Settings
 
 class CubifyCppSettings(bpy.types.PropertyGroup):
@@ -659,8 +644,7 @@ class OBJECT_OT_cubify_cpp_bake_frames(bpy.types.Operator):
             key = me0.shape_keys
             key.use_relative = False
 
-            # ---- per-frame solve, warm-started from the previous frame
-            V_prev = Vw_prev = None
+            # ---- per-frame solve
             device = None
             t0 = time.time()
             for i, f in enumerate(frames):
@@ -680,26 +664,20 @@ class OBJECT_OT_cubify_cpp_bake_frames(bpy.types.Operator):
 
                 A_f = rotation_part(M) @ A if props.anim_axes == 'OBJECT' else A
 
-                # ARAP is invariant under a global rotation of the output,
-                # so a warm start left in the previous frame's orientation
-                # would keep the result there. Carry it along by however
-                # the rest pose moved (object transform, armature, ...).
-                V_init = None
-                if V_prev is not None:
-                    s, R, t = similarity_align(Vw_prev, Vw)
-                    V_init = s * V_prev @ R.T + t
-
-                # the rest pose changes every frame, so each frame needs its
-                # own system (cotan weights depend on it)
+                # Every frame is solved from its own pose, never warm-started
+                # from the previous result: ARAP leaves the output's global
+                # rotation free, so the cube term would turn an already
+                # cubified shape back to its earlier orientation and the
+                # bake would stop following the animation. The rest pose
+                # changes every frame, so each frame also needs its own
+                # system (cotan weights depend on it).
                 stylizer, device, _ = create_stylizer(context, Vw, F, props.cubeness,
                                                       A_f, pins)
                 with stylizer:
-                    V_out = stylizer.solve(V_init=V_init,
-                                           iterations=props.iterations,
-                                           admm_iters=props.admm_iterations)
+                    V_out = stylizer.run(iterations=props.iterations,
+                                         admm_iters=props.admm_iterations)
                 if not np.all(np.isfinite(V_out)):
                     raise RuntimeError(f"invalid positions at frame {f}")
-                V_prev, Vw_prev = V_out, Vw  # warm start from the unfixed solve
                 if props.auto_fix_walls:
                     V_out, _ = fix_walls(context, Vw, V_out, F)
 
