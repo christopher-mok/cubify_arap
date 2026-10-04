@@ -445,6 +445,7 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
 
             # ---- per-frame solve, warm-started from the previous frame
             V_prev = None
+            M_prev = None
             device = warned = None
             t0 = time.time()
             for i, f in enumerate(frames):
@@ -462,18 +463,30 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
                 M = np.array(ob_eval.matrix_world, dtype=np.float64)
                 Vw = V.reshape(-1, 3) @ M[:3, :3].T + M[:3, 3]
 
+                # Warm-start through the object's delta transform. ARAP is
+                # invariant under a global rotation of the output, so a
+                # warm start left in the previous frame's pose would pin
+                # the orientation there (the mesh would stop rotating).
+                V_init = None
+                if V_prev is not None:
+                    try:
+                        delta = M @ np.linalg.inv(M_prev)
+                        V_init = V_prev @ delta[:3, :3].T + delta[:3, 3]
+                    except np.linalg.LinAlgError:
+                        V_init = V_prev
+
                 stylizer, device, warn = solver.create_stylizer(
                     Vw, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
                     device=props.device)
                 if warn and not warned:
                     self.report({'WARNING'}, f"{ob.name}: {warn}")
                     warned = True
-                V_out = stylizer.solve(V_init=V_prev,
+                V_out = stylizer.solve(V_init=V_init,
                                        iterations=props.iterations,
                                        admm_iters=props.admm_iterations)
                 if not np.all(np.isfinite(V_out)):
                     raise RuntimeError(f"invalid positions at frame {f}")
-                V_prev = V_out
+                V_prev, M_prev = V_out, M
 
                 kb = new_ob.shape_key_add(name=f"Frame {f:04d}", from_mix=False)
                 kb.interpolation = 'KEY_LINEAR'
