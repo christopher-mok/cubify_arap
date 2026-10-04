@@ -5,7 +5,9 @@ on:
     branches: ["**"]
     tags: ["v*"]
     paths:
-      - "cubic_stylization_c++/**"
+      # '+' is a special character in Actions filter globs, so the literal
+      # directory name cubic_stylization_c++ cannot be used here
+      - "cubic_stylization_c*/**"
       - ".github/workflows/build-cpp.yml"
   workflow_dispatch:
 
