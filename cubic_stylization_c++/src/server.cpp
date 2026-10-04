@@ -28,6 +28,7 @@
 
 #include "cubic_stylizer.h"
 #include "protocol.h"
+#include "thin_walls.h"
 
 namespace {
 
@@ -155,6 +156,9 @@ class Server {
         sessions_.erase(in.get<uint32_t>());
         Writer().send();
         return true;
+      case protocol::kFixThinWalls:
+        fix_walls(in);
+        return true;
       case protocol::kShutdown:
         Writer().send();
         return false;
@@ -170,6 +174,7 @@ class Server {
     const int32_t k = in.get<int32_t>();
     const int32_t threads = in.get<int32_t>();
     const double lam = in.get<double>();
+    const double flat_relax = in.get<double>();
     if (n < 0 || m < 0 || k < 0) throw std::invalid_argument("negative array size");
 
     Eigen::Matrix<double, 3, 3, Eigen::RowMajor> A;
@@ -181,7 +186,7 @@ class Server {
     in.take(pins.data(), sizeof(int32_t) * static_cast<size_t>(k));
 
     auto s = std::make_unique<Session>();
-    s->stylizer = std::make_unique<CubicStylizer>(V, F, lam, Eigen::Matrix3d(A), pins);
+    s->stylizer = std::make_unique<CubicStylizer>(V, F, lam, Eigen::Matrix3d(A), pins, flat_relax);
     s->threads = threads;
 
     const uint32_t id = next_id_++;
@@ -229,7 +234,6 @@ class Server {
     int done = 0;
     RowMatX3d V = st.solve(pin_ptr, init_ptr, std::max(iterations, 0), std::max(admm_iters, 1),
                            pool(s.threads), progress, &done);
-    if ((flags & protocol::kRecenter) && st.pins().empty()) st.recenter(V);
     if (!V.allFinite()) throw std::runtime_error("solver produced non-finite positions");
     s.last = V;
     s.has_last = true;
@@ -238,6 +242,34 @@ class Server {
     w.put<int32_t>(done);
     w.put<int32_t>(static_cast<int32_t>(V.rows()));
     w.put_bytes(V.data(), sizeof(double) * static_cast<size_t>(V.size()));
+    w.send();
+  }
+
+  void fix_walls(Reader& in) {
+    const int32_t n = in.get<int32_t>();
+    const int32_t m = in.get<int32_t>();
+    const int32_t iterations = in.get<int32_t>();
+    const int32_t threads = in.get<int32_t>();
+    const double min_thickness = in.get<double>();
+    const double max_wall = in.get<double>();
+    if (n < 0 || m < 0) throw std::invalid_argument("negative array size");
+    RowMatX3d V_rest = in.mat3d(n);
+    RowMatX3d V = in.mat3d(n);
+    RowMatX3i F(m, 3);
+    in.take(F.data(), sizeof(int32_t) * 3 * static_cast<size_t>(m));
+
+    ThinWallResult r = fix_thin_walls(V_rest, V, F, min_thickness, max_wall,
+                                      std::max(iterations, 0), pool(threads));
+    if (!r.V.allFinite()) throw std::runtime_error("thin-wall fix produced non-finite positions");
+    Writer w;
+    w.put<int32_t>(r.walls);
+    w.put<int32_t>(r.crossed_before);
+    w.put<int32_t>(r.crossed_after);
+    w.put<int32_t>(r.moved);
+    w.put<int32_t>(r.passes);
+    w.put<int32_t>(n);
+    w.put<double>(r.max_move);
+    w.put_bytes(r.V.data(), sizeof(double) * static_cast<size_t>(r.V.size()));
     w.send();
   }
 
@@ -342,7 +374,6 @@ int selftest(int rings) {
   auto t1 = clock::now();
   int done = 0;
   RowMatX3d out = st.solve(nullptr, nullptr, 30, 100, pool, nullptr, &done);
-  st.recenter(out);
   auto t2 = clock::now();
 
   // after cubification most surface area should face a cube axis

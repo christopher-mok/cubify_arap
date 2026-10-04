@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace cubify {
 
@@ -17,6 +19,15 @@ constexpr double kMu = 10.0;
 constexpr double kTau = 2.0;
 constexpr double kEpsAbs = 1e-5;
 constexpr double kEpsRel = 1e-3;
+
+// Square flat regions: a vertex counts as axis-aligned when the cosine
+// between its normal and the nearest cube axis reaches kFlatHi (~8 deg),
+// ramping in from kFlatLo (~14 deg).
+constexpr double kFlatLo = 0.97;
+constexpr double kFlatHi = 0.99;
+
+// Parts closer than this (fraction of the bounding-box diagonal) touch.
+constexpr double kContactDistance = 0.005;
 
 // Closest rotation to M (orthogonal Procrustes): R = V U^T for M = U S V^T,
 // with the reflection case fixed by flipping the smallest singular vector.
@@ -55,8 +66,13 @@ struct UnionFind {
 
 CubicStylizer::CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cubeness,
                              const Eigen::Matrix3d& cube_axes,
-                             const std::vector<int32_t>& pins)
-    : V0_(V), F_(F), n_(static_cast<int>(V.rows())), lam_(cubeness), A_(cube_axes) {
+                             const std::vector<int32_t>& pins, double flat_relax)
+    : V0_(V),
+      F_(F),
+      n_(static_cast<int>(V.rows())),
+      lam_(cubeness),
+      A_(cube_axes),
+      flat_relax_(std::clamp(flat_relax, 1e-4, 1.0)) {
   if (n_ == 0 || F_.rows() == 0) throw std::invalid_argument("mesh has no vertices or faces");
   if (F_.minCoeff() < 0 || F_.maxCoeff() >= n_)
     throw std::invalid_argument("face index out of range");
@@ -69,6 +85,7 @@ CubicStylizer::CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cube
     throw std::invalid_argument("pin index out of range");
 
   build_edges();
+  w_base_ = w_;
   build_normals_and_areas();
   build_solver();
 
@@ -172,11 +189,9 @@ void CubicStylizer::build_normals_and_areas() {
 
 void CubicStylizer::build_solver() {
   // Anchors: user pins, loose vertices (no incident face), and one vertex of
-  // every connected component that has neither — the energy is
-  // translation-invariant per component, so this keeps the system regular.
-  // Those auto-anchored components "float": after every global step they are
-  // translated back to their rest centroid (see keep_floating_centroids), so
-  // disconnected parts of one object keep their relative placement.
+  // every connected part that has neither. The energy is translation-
+  // invariant per part, so this keeps the system regular; the anchor's
+  // position is arbitrary and overridden by place_floating_parts.
   anchored_.assign(n_, 0);
   for (int32_t p : pins_) anchored_[p] = 1;
   for (int i = 0; i < n_; ++i)
@@ -186,25 +201,152 @@ void CubicStylizer::build_solver() {
   for (int i = 0; i < n_; ++i)
     for (int32_t s = row_start_[i]; s < row_start_[i + 1]; ++s)
       if (col_[s] > i && w_[s] > 1e-12) uf.unite(i, col_[s]);
-  std::vector<char> has_anchor(n_, 0);
-  for (int i = 0; i < n_; ++i)
-    if (anchored_[i]) has_anchor[uf.find(i)] = 1;
-  std::vector<int32_t> float_of_root(n_, -1);
-  floating_.assign(n_, -1);
-  for (int i = 0; i < n_; ++i) {
-    int32_t r = uf.find(i);
-    if (!has_anchor[r]) {
-      anchored_[i] = 1;
-      has_anchor[r] = 1;
-      float_of_root[r] = num_floating_++;
-    }
-    floating_[i] = float_of_root[r];
-  }
-  float_rest_centroid_ = centroids(V0_);
 
+  // dense part ids; loose vertices belong to no part
+  std::vector<int32_t> comp(n_, -1), id_of_root(n_, -1);
+  int ncomp = 0;
+  for (int i = 0; i < n_; ++i) {
+    if (deg_[i] <= 1e-12) continue;
+    int32_t r = uf.find(i);
+    if (id_of_root[r] < 0) id_of_root[r] = ncomp++;
+    comp[i] = id_of_root[r];
+  }
+  std::vector<char> pinned(ncomp, 0), seen(ncomp, 0);
+  for (int32_t p : pins_)
+    if (comp[p] >= 0) pinned[comp[p]] = 1;
+  for (int i = 0; i < n_; ++i) {
+    const int32_t c = comp[i];
+    if (c >= 0 && !pinned[c] && !seen[c]) {
+      anchored_[i] = 1;
+      seen[c] = 1;
+    }
+  }
+
+  build_part_placement(comp, pinned);
+  factorize(true);
+}
+
+void CubicStylizer::build_part_placement(const std::vector<int32_t>& comp,
+                                         const std::vector<char>& pinned) {
+  const int ncomp = static_cast<int>(pinned.size());
+  std::vector<std::vector<int32_t>> verts(ncomp);
+  for (int i = 0; i < n_; ++i)
+    if (comp[i] >= 0) verts[comp[i]].push_back(i);
+
+  // Contacts: every vertex of an unpinned part paired with its nearest
+  // vertex of another part within kContactDistance (uniform grid search).
+  std::vector<std::vector<std::pair<int32_t, int32_t>>> contacts(ncomp);
+  const double diag = (V0_.colwise().maxCoeff() - V0_.colwise().minCoeff()).norm();
+  const double tau = kContactDistance * diag;
+  if (ncomp > 1 && tau > 0.0) {
+    const Eigen::RowVector3d lo = V0_.colwise().minCoeff();
+    auto cell_of = [&](int i) {
+      Eigen::RowVector3d c = ((V0_.row(i) - lo) / tau).array().floor().matrix();
+      return Eigen::Vector3i(static_cast<int>(c[0]), static_cast<int>(c[1]),
+                             static_cast<int>(c[2]));
+    };
+    auto key = [](int x, int y, int z) {
+      return (static_cast<int64_t>(x) << 42) ^ (static_cast<int64_t>(y) << 21) ^
+             static_cast<int64_t>(z);
+    };
+    std::unordered_map<int64_t, std::vector<int32_t>> grid;
+    for (int i = 0; i < n_; ++i) {
+      if (comp[i] < 0) continue;
+      Eigen::Vector3i c = cell_of(i);
+      grid[key(c[0], c[1], c[2])].push_back(i);
+    }
+    for (int i = 0; i < n_; ++i) {
+      if (comp[i] < 0 || pinned[comp[i]]) continue;
+      Eigen::Vector3i c = cell_of(i);
+      int32_t best = -1;
+      double best_d2 = tau * tau;
+      for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dz = -1; dz <= 1; ++dz) {
+            auto it = grid.find(key(c[0] + dx, c[1] + dy, c[2] + dz));
+            if (it == grid.end()) continue;
+            for (int32_t u : it->second) {
+              if (comp[u] == comp[i]) continue;
+              const double d2 = (V0_.row(u) - V0_.row(i)).squaredNorm();
+              if (d2 < best_d2) {
+                best_d2 = d2;
+                best = u;
+              }
+            }
+          }
+      if (best >= 0) contacts[comp[i]].push_back({i, best});
+    }
+  }
+
+  // touched_by[c]: parts with contacts into part c
+  std::vector<std::vector<int32_t>> touched_by(ncomp);
+  for (int c = 0; c < ncomp; ++c)
+    for (const auto& vu : contacts[c]) touched_by[comp[vu.second]].push_back(c);
+  for (auto& t : touched_by) {
+    std::sort(t.begin(), t.end());
+    t.erase(std::unique(t.begin(), t.end()), t.end());
+  }
+
+  // Placement order: pinned parts are held by their pins; a part touching
+  // placed geometry follows it (breadth-first); when nothing left touches,
+  // the largest remaining part keeps its rest centroid.
+  std::vector<char> placed(pinned.begin(), pinned.end()), queued(ncomp, 0);
+  std::deque<int32_t> queue;
+  auto enqueue_touching = [&](int c) {
+    for (int32_t d : touched_by[c])
+      if (!placed[d] && !queued[d]) {
+        queued[d] = 1;
+        queue.push_back(d);
+      }
+  };
+  auto place = [&](int c, bool by_contact) {
+    Part part;
+    part.verts = std::move(verts[c]);
+    for (int32_t v : part.verts) part.rest_centroid += row3(V0_, v);
+    part.rest_centroid /= static_cast<double>(part.verts.size());
+    if (by_contact) {
+      for (const auto& vu : contacts[c])
+        if (placed[comp[vu.second]]) {
+          part.contacts.push_back(vu);
+          part.rest_offset += row3(V0_, vu.first) - row3(V0_, vu.second);
+        }
+      if (!part.contacts.empty())
+        part.rest_offset /= static_cast<double>(part.contacts.size());
+    }
+    part.by_contact = !part.contacts.empty();
+    placed[c] = 1;
+    parts_.push_back(std::move(part));
+    enqueue_touching(c);
+  };
+
+  std::vector<int32_t> by_size;
+  for (int c = 0; c < ncomp; ++c) {
+    if (pinned[c])
+      enqueue_touching(c);
+    else
+      by_size.push_back(c);
+  }
+  std::stable_sort(by_size.begin(), by_size.end(), [&](int32_t a, int32_t b) {
+    return verts[a].size() > verts[b].size();
+  });
+  size_t next_seed = 0;
+  for (;;) {
+    while (!queue.empty()) {
+      const int32_t c = queue.front();
+      queue.pop_front();
+      if (!placed[c]) place(c, true);
+    }
+    while (next_seed < by_size.size() && placed[by_size[next_seed]]) ++next_seed;
+    if (next_seed == by_size.size()) break;
+    place(by_size[next_seed], false);
+  }
+}
+
+void CubicStylizer::factorize(bool analyze) {
   // Free rows keep only free columns (edges into anchors go to the
   // right-hand side), anchor rows are identity: the matrix is
-  // blockdiag(L_ff, I) up to permutation, hence SPD.
+  // blockdiag(L_ff, I) up to permutation, hence SPD. The sparsity pattern
+  // never changes, so reweighting only refactorizes numerically.
   std::vector<Eigen::Triplet<double>> T;
   T.reserve(col_.size() + n_);
   for (int i = 0; i < n_; ++i) {
@@ -220,13 +362,74 @@ void CubicStylizer::build_solver() {
   L.setFromTriplets(T.begin(), T.end());
   L.makeCompressed();
 
-  ldlt_.compute(L);
-  if (ldlt_.info() != Eigen::Success) {
+  if (!lu_) {
+    if (analyze) ldlt_.analyzePattern(L);
+    ldlt_.factorize(L);
+    if (ldlt_.info() == Eigen::Success) return;
     lu_ = std::make_unique<Eigen::SparseLU<Eigen::SparseMatrix<double>>>();
-    lu_->analyzePattern(L);
-    lu_->factorize(L);
-    if (lu_->info() != Eigen::Success)
-      throw std::runtime_error("could not factorize the system matrix (degenerate mesh?)");
+    analyze = true;
+  }
+  if (analyze) lu_->analyzePattern(L);
+  lu_->factorize(L);
+  if (lu_->info() != Eigen::Success)
+    throw std::runtime_error("could not factorize the system matrix (degenerate mesh?)");
+}
+
+void CubicStylizer::reweight_flat_regions(const RowMatX3d& V) {
+  std::vector<Eigen::Vector3d> nrm(n_, Eigen::Vector3d::Zero());
+  for (Eigen::Index f = 0; f < F_.rows(); ++f) {
+    const int32_t a = F_(f, 0), b = F_(f, 1), c = F_(f, 2);
+    const Eigen::Vector3d fn = (row3(V, b) - row3(V, a)).cross(row3(V, c) - row3(V, a));
+    nrm[a] += fn;
+    nrm[b] += fn;
+    nrm[c] += fn;
+  }
+  // g = 1 where the vertex normal faces a cube axis, 0 where it does not
+  std::vector<double> g(n_, 0.0);
+  for (int i = 0; i < n_; ++i) {
+    const double len = nrm[i].norm();
+    if (len < 1e-12) continue;
+    const double al = (A_.transpose() * nrm[i] / len).cwiseAbs().maxCoeff();
+    g[i] = std::clamp((al - kFlatLo) / (kFlatHi - kFlatLo), 0.0, 1.0);
+  }
+  for (int i = 0; i < n_; ++i) {
+    deg_[i] = 0.0;
+    for (int32_t s = row_start_[i]; s < row_start_[i + 1]; ++s) {
+      const double f = 1.0 - (1.0 - flat_relax_) * std::min(g[i], g[col_[s]]);
+      w_[s] = w_base_[s] * f;
+      deg_[i] += w_[s];
+    }
+  }
+  weights_relaxed_ = true;
+  factorize(false);
+}
+
+void CubicStylizer::restore_base_weights() {
+  if (!weights_relaxed_) return;
+  w_ = w_base_;
+  for (int i = 0; i < n_; ++i) {
+    deg_[i] = 0.0;
+    for (int32_t s = row_start_[i]; s < row_start_[i + 1]; ++s) deg_[i] += w_[s];
+  }
+  weights_relaxed_ = false;
+  factorize(false);
+}
+
+void CubicStylizer::place_floating_parts(RowMatX3d& V) const {
+  for (const Part& part : parts_) {
+    Eigen::Vector3d t;
+    if (part.by_contact) {
+      // least-squares translation restoring the mean contact offset; the
+      // touched vertices were placed earlier in this same pass
+      Eigen::Vector3d cur = Eigen::Vector3d::Zero();
+      for (const auto& vu : part.contacts) cur += row3(V, vu.first) - row3(V, vu.second);
+      t = part.rest_offset - cur / static_cast<double>(part.contacts.size());
+    } else {
+      Eigen::Vector3d c = Eigen::Vector3d::Zero();
+      for (int32_t v : part.verts) c += row3(V, v);
+      t = part.rest_centroid - c / static_cast<double>(part.verts.size());
+    }
+    for (int32_t v : part.verts) V.row(v) += t.transpose();
   }
 }
 
@@ -323,27 +526,6 @@ RowMatX3d CubicStylizer::global_step(const RowMatX3d& ppos, ThreadPool& pool) {
   return RowMatX3d(x);
 }
 
-std::vector<Eigen::Vector3d> CubicStylizer::centroids(const RowMatX3d& V) const {
-  std::vector<Eigen::Vector3d> sum(num_floating_, Eigen::Vector3d::Zero());
-  std::vector<double> count(num_floating_, 0.0);
-  for (int i = 0; i < n_; ++i) {
-    if (floating_[i] < 0) continue;
-    sum[floating_[i]] += row3(V, i);
-    count[floating_[i]] += 1.0;
-  }
-  for (int c = 0; c < num_floating_; ++c) sum[c] /= count[c];
-  return sum;
-}
-
-void CubicStylizer::keep_floating_centroids(RowMatX3d& V) const {
-  if (num_floating_ == 0) return;
-  std::vector<Eigen::Vector3d> cur = centroids(V);
-  for (int i = 0; i < n_; ++i) {
-    const int32_t c = floating_[i];
-    if (c >= 0) V.row(i) += (float_rest_centroid_[c] - cur[c]).transpose();
-  }
-}
-
 // ---------------- drivers ----------------
 
 RowMatX3d CubicStylizer::solve(const RowMatX3d* pin_pos, const RowMatX3d* V_init,
@@ -363,9 +545,17 @@ RowMatX3d CubicStylizer::solve(const RowMatX3d* pin_pos, const RowMatX3d* V_init
 
   int done = 0;
   for (int it = 0; it < iterations; ++it) {
+    // The first iteration of a session runs with plain weights: relaxing
+    // regions flat in the *rest* pose (e.g. the tip of a knob, around a
+    // high-valence pole) lets them collapse before anything has cubified.
+    if (flat_relax_ < 1.0 && lam_ > 0.0 && has_iterated_)
+      reweight_flat_regions(V);
+    else
+      restore_base_weights();
     local_step(V, admm_iters, pool);
     RowMatX3d V_new = global_step(ppos, pool);
-    keep_floating_centroids(V_new);
+    place_floating_parts(V_new);
+    has_iterated_ = true;
     const double step = (V_new - V).rowwise().norm().maxCoeff();
     V = std::move(V_new);
     done = it + 1;
@@ -374,11 +564,6 @@ RowMatX3d CubicStylizer::solve(const RowMatX3d* pin_pos, const RowMatX3d* V_init
   }
   if (iterations_done != nullptr) *iterations_done = done;
   return V;
-}
-
-void CubicStylizer::recenter(RowMatX3d& V) const {
-  const Eigen::RowVector3d shift = V0_.colwise().mean() - V.colwise().mean();
-  V.rowwise() += shift;
 }
 
 }  // namespace cubify

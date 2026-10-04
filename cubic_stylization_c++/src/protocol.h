@@ -15,6 +15,7 @@
 //
 //   HELLO      -> int32 protocol_version, int32 hardware_threads, utf8 version
 //   CREATE     int32 n, int32 m, int32 k, int32 threads, f64 cubeness,
+//              f64 flat_relax (1 = off, see CubicStylizer),
 //              f64 A[9] (row-major cube axes), f64 V[3n], int32 F[3m],
 //              int32 pins[k]
 //              -> uint32 session, int32 kp, int32 pins[kp] (sorted, unique)
@@ -25,6 +26,11 @@
 //   SET_LAMBDA uint32 session, f64 cubeness            -> (empty)
 //   SET_THREADS uint32 session, int32 threads          -> (empty)
 //   DESTROY    uint32 session                          -> (empty)
+//   FIX_THIN_WALLS (no session) int32 n, int32 m, int32 iterations,
+//              int32 threads, f64 min_thickness, f64 max_wall,
+//              f64 V_rest[3n], f64 V[3n], int32 F[3m]
+//              -> int32 walls, int32 crossed_before, int32 crossed_after,
+//                 int32 moved, int32 passes, int32 n, f64 max_move, f64 V[3n]
 //   SHUTDOWN   (empty)                                 -> (empty), then exit
 
 #pragma once
@@ -34,7 +40,7 @@
 namespace cubify {
 namespace protocol {
 
-constexpr int32_t kVersion = 1;
+constexpr int32_t kVersion = 3;
 
 enum Op : uint32_t {
   kHello = 0,
@@ -44,6 +50,7 @@ enum Op : uint32_t {
   kSetThreads = 4,
   kDestroy = 5,
   kShutdown = 6,
+  kFixThinWalls = 7,
 };
 
 enum Resp : uint32_t {
@@ -56,7 +63,7 @@ enum SolveFlags : uint32_t {
   kHasPinPos = 1u << 0,  // pin targets follow (else pins stay at rest)
   kHasVInit = 1u << 1,   // warm-start positions follow
   kReportProgress = 1u << 2,
-  kRecenter = 1u << 3,   // one-shot "run": recentre when nothing is pinned
+  // 1u << 3 was kRecenter in protocol 1; parts now place themselves
   kWarmLast = 1u << 4,   // warm-start from this session's previous result
 };
 

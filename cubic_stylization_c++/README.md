@@ -55,8 +55,21 @@ timings, without Blender.
 
 ## Using it
 
-Identical to the Python add-on (see its README), with one change:
+Identical to the Python add-on (see its README), with these changes:
 
+- **Square Flat Regions** (off by default) plus a **Strength** slider,
+  under Cubeness. See below.
+- **Auto-fix Thin Walls** (off by default) and a **Fix Now** button, under
+  Cubify Mesh. See below.
+- **Repeat** (default 1), under ADMM Iterations: Cubify Mesh runs this
+  many passes, each starting from the previous result — exactly the same
+  as pressing Cubify again, so the style compounds. No existing parameter
+  is equivalent: more Iterations barely changes a pass (teapot axis-aligned
+  area 0.79 → 0.80 at 60 iterations), and Cubeness is the closest but not
+  the same (teapot: 2 passes ≈ Cubeness 0.4, both 0.83; bunny: 2 passes
+  0.40, more than Cubeness 0.6 at 0.38). Pins stay put across passes, Fix
+  Thin Walls measures against the shape before the first pass, and time
+  scales with the count. It applies to Cubify Mesh, not the bakes.
 - **Threads** replaces **Device**: CPU threads for the solver, 0 = all
   cores. There is no GPU backend and no PyTorch install. For reference,
   the Python README's 163,842-vertex benchmark (10 iterations) takes 2.3 s
@@ -68,13 +81,67 @@ Steps, Iterations / Step, Frame Step), Cubify Every Frame (to Copy), Set /
 Add / Clear Pins, Stylized Drag, Drag Iterations, Start Manipulation — works
 the same way.
 
+## Square Flat Regions
+
+Cubic stylization rewards surface *normals* that face a cube axis; it never
+looks at outlines. A flat, wide part such as a pot lid or a plate already
+faces +Z almost everywhere, so its round outline costs nothing and stays
+round, while the tall sides of the pot around it straighten into a box.
+Raising Cubeness does not fix this: the part crumples before it squares.
+
+With **Square Flat Regions** on, surfaces that already face a cube axis
+(within about 8°, re-checked every iteration) become nearly free to
+stretch in their own plane. Their rims can then pull the outline square.
+On the Utah teapot the lid's top-view outline goes from round (squareness
+0.07 on a 0 = circle, 1 = square scale) to 0.42, and the rim it sits in
+from 0.32 to 0.61; the bunny looks practically unchanged.
+
+- **Strength** scales how freely flat regions may stretch; 1 (default)
+  scales their ARAP weights down to 1%, 0 has no effect.
+- The first iteration of each solve setup runs without it, so regions
+  that are flat only in the rest pose (a knob's tip) are not collapsed.
+- It refactorizes the system every iteration: Cubify is about 3× slower
+  (teapot, 17.8k vertices: 0.19 s → 0.62 s). It is not used while
+  dragging pins.
+- This goes beyond the paper; with it off, results match the paper's
+  energy.
+
+## Fix Thin Walls
+
+Solid-shell meshes have walls with an inner and an outer surface (a
+teapot's spout, the rim of a pot). Nothing in the stylization energy ties
+the two sides together, so cubifying can push one through the other — the
+inside shows through as backfaces. Parts that touch (a lid on its rim) can
+likewise sink into each other.
+
+**Fix Now** pushes them apart again. In the shape from before the last
+Cubify, every vertex is paired with the opposite-facing surface behind it
+(wall thickness) and in front of it (narrow gaps), up to 4% of the
+bounding-box diagonal away. Wherever a pair got closer than **Min
+Thickness** (default 10%) of its original distance, or crossed, both sides
+are pushed apart along the normal with a smoothed correction, repeating
+until none is left.
+
+- Cubify stores the pre-cubify shape on the mesh (hidden attribute
+  `.cubify_rest`, saved with the .blend), so the button works any time
+  after a Cubify by this add-on; without it, the object is skipped.
+  Running it twice is harmless.
+- **Auto-fix Thin Walls** runs it after every Cubify, and on every step of
+  both animation bakes (the solver itself keeps warm-starting from its
+  unfixed result).
+- **Min Thickness** and **Iterations** are in the button's redo panel.
+- On the Utah teapot (λ 0.2): crossing triangle pairs 663 → 30 (the
+  original mesh has 3), about 2.6k of 17.8k vertices move (at most 0.14),
+  the cubic look is kept (axis-aligned area 0.79 → 0.78), in 0.05 s.
+
 ## Architecture
 
 ```
 Blender (Python)                          cubify_server (C++)
 __init__.py  operators, UI                server.cpp        request loop, sessions
 client.py    process + protocol  ──pipe──▶ cubic_stylizer.*  solver (Eigen)
-builder.py   CMake build                  thread_pool.h     parallel_for
+builder.py   CMake build                  thin_walls.*      Fix Thin Walls
+                                          thread_pool.h     parallel_for
 ```
 
 - One server process per Blender session, started on first use and
@@ -93,12 +160,19 @@ normal meshes):
 - The global step uses a sparse Cholesky (`SimplicialLDLT`) of the
   pinned Laplacian instead of LU / conjugate gradient. The pinned
   system is symmetric positive definite, so Cholesky applies.
-- Loose parts of one object keep their relative placement. A connected
-  part with no pins floats: after every iteration it is translated back
-  to its rest-pose centroid. Parts with pins are held by the pins, and
-  loose vertices stay put. The numpy solver fixes only vertex 0, so
-  unpinned parts drift relative to each other. This also means a bake of
-  an unpinned mesh keeps its centroid fixed, rather than vertex 0.
+- Loose parts of one object keep their relative placement. The energy
+  does not couple separate parts, so each part without pins is placed
+  by translation after every iteration (its shape is never changed):
+  - a part that touches already-placed geometry (closer than 0.5% of the
+    bounding-box diagonal) keeps the average offset at its contact
+    points, so a lid stays seated on the pot's rim even though both
+    change shape;
+  - otherwise the largest remaining part keeps its rest-pose centroid;
+  - parts with pins are held by the pins, and loose vertices stay put.
+
+  The numpy solver fixes only vertex 0, so its unpinned parts drift
+  relative to each other. A bake of an unpinned mesh likewise keeps its
+  centroid fixed here, rather than vertex 0.
 - The local step runs each vertex's ADMM to its own convergence on a
   thread pool, rather than batched numpy over the still-active vertices.
   The arithmetic is the same.
@@ -109,9 +183,13 @@ normal meshes):
 
 ```sh
 python tests/test_against_python.py      # C++ vs the numpy solver, timings
+python tests/test_parts_and_flat.py      # teapot: lid seating, Square Flat Regions
+python tests/test_thin_walls.py          # teapot: thin-wall fix
 blender -b --factory-startup --python tests/blender_smoke_test.py
 ```
 
 The Blender smoke test runs every operator except the modal drag, which
 needs a viewport. It also checks that topology and UVs are preserved and
-that both add-ons coexist. It passes on Blender 3.6 and 5.0.
+that both add-ons coexist, and runs the teapot from `../test_objs` with
+Square Flat Regions off and on, and with Fix Thin Walls (counting crossing
+triangles). It passes on Blender 3.6 and 5.0.

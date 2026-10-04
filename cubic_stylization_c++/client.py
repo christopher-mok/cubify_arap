@@ -16,15 +16,15 @@ import threading
 
 import numpy as np
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 3
 
-OP_HELLO, OP_CREATE, OP_SOLVE, OP_SET_LAMBDA, OP_SET_THREADS, OP_DESTROY, OP_SHUTDOWN = range(7)
+(OP_HELLO, OP_CREATE, OP_SOLVE, OP_SET_LAMBDA, OP_SET_THREADS, OP_DESTROY, OP_SHUTDOWN,
+ OP_FIX_THIN_WALLS) = range(8)
 RESP_OK, RESP_ERROR, RESP_PROGRESS = range(3)
 
 FLAG_PIN_POS = 1 << 0
 FLAG_V_INIT = 1 << 1
 FLAG_PROGRESS = 1 << 2
-FLAG_RECENTER = 1 << 3
 FLAG_WARM_LAST = 1 << 4
 
 _HEADER = struct.Struct("<IIQ")
@@ -193,10 +193,13 @@ class RemoteStylizer:
     V : (n, 3) rest-pose positions; F : (m, 3) triangle indices
     cubeness : lambda (0 = classic ARAP); cube_axes : (3, 3) rotation
     pins : vertex indices to constrain; threads : 0 = all cores
+    flat_relax : edge-weight factor inside regions already facing a cube
+                 axis, in (0, 1]; < 1 lets flat parts square their outline
+                 (1 = off, the paper's energy)
     """
 
     def __init__(self, server, V, F, cubeness=0.2, cube_axes=None, pins=None,
-                 threads=0):
+                 threads=0, flat_relax=1.0):
         V = _f64(V)
         F = np.ascontiguousarray(F, dtype=np.int32).reshape(-1, 3)
         A = np.eye(3) if cube_axes is None else np.asarray(cube_axes, dtype=np.float64)
@@ -207,7 +210,8 @@ class RemoteStylizer:
         self._lam = float(cubeness)
         payload = server.request(
             OP_CREATE,
-            struct.pack("<iiiid", len(V), len(F), len(pins), int(threads), self._lam),
+            struct.pack("<iiiidd", len(V), len(F), len(pins), int(threads), self._lam,
+                        float(flat_relax)),
             np.ascontiguousarray(A.reshape(3, 3), dtype=np.float64), V, F, pins)
         self.id, kp = struct.unpack_from("<Ii", payload)
         self.pins = np.frombuffer(payload, dtype=np.int32, count=kp, offset=8).astype(np.int64)
@@ -229,7 +233,7 @@ class RemoteStylizer:
     # ---- drivers
 
     def solve(self, pin_pos=None, V_init=None, iterations=30, admm_iters=100,
-              on_progress=None, warm_last=False, _recenter=False):
+              on_progress=None, warm_last=False):
         """Run local-global iterations and return the (n, 3) positions.
 
         pin_pos : (len(self.pins), 3) targets for the pinned vertices
@@ -250,8 +254,6 @@ class RemoteStylizer:
             flags |= FLAG_WARM_LAST
         if on_progress is not None:
             flags |= FLAG_PROGRESS
-        if _recenter:
-            flags |= FLAG_RECENTER
         parts[0] = struct.pack("<IiiI", self.id, int(iterations), int(admm_iters), flags)
 
         payload = self.server.request(OP_SOLVE, *parts, on_progress=on_progress)
@@ -259,11 +261,11 @@ class RemoteStylizer:
         return np.frombuffer(payload, dtype=np.float64, count=3 * n, offset=8).reshape(n, 3).copy()
 
     def run(self, iterations=30, admm_iters=100, on_progress=None, pin_pos=None):
-        """One-shot stylization. Holds pinned vertices (if any) in place;
-        otherwise keeps the result centered where the input was."""
+        """One-shot stylization from the rest pose. Pinned vertices are held;
+        unpinned parts stay seated on what they touch, or centred where they
+        were."""
         return self.solve(pin_pos=pin_pos, iterations=iterations,
-                          admm_iters=admm_iters, on_progress=on_progress,
-                          _recenter=True)
+                          admm_iters=admm_iters, on_progress=on_progress)
 
     def close(self):
         """Free the server-side session (safe to call more than once)."""
@@ -284,7 +286,7 @@ class RemoteStylizer:
 
 
 def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None, threads=0,
-                    server_path=None):
+                    server_path=None, flat_relax=1.0):
     """Build a stylizer on the C++ server.
 
     Returns (stylizer, device_label, warning) like the Python add-on's
@@ -292,6 +294,35 @@ def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None, threads=0,
     """
     server = get_server(server_path)
     s = RemoteStylizer(server, V, F, cubeness=cubeness, cube_axes=cube_axes,
-                       pins=pins, threads=threads)
+                       pins=pins, threads=threads, flat_relax=flat_relax)
     used = threads if threads and threads > 0 else server.hardware_threads
     return s, f"C++ ({used} thread{'s' if used != 1 else ''})", None
+
+
+def fix_thin_walls(V_rest, V, F, min_thickness=0.1, max_wall=0.04, iterations=60,
+                   threads=0, server_path=None):
+    """Push apart thin walls that stylization made cross (or nearly cross).
+
+    V_rest : (n, 3) pose the walls are measured in (before stylization)
+    V : (n, 3) stylized positions to fix; F : (m, 3) triangles
+    min_thickness : walls are pushed back to at least this fraction of their
+                    rest thickness
+    max_wall : thickest wall considered, fraction of the bounding-box diagonal
+
+    Returns (V_fixed, stats) with stats keys walls, crossed_before,
+    crossed_after, moved, passes, max_move.
+    """
+    V_rest, V = _f64(V_rest), _f64(V)
+    F = np.ascontiguousarray(F, dtype=np.int32).reshape(-1, 3)
+    if len(V_rest) != len(V):
+        raise ValueError("rest and current vertex counts differ")
+    payload = get_server(server_path).request(
+        OP_FIX_THIN_WALLS,
+        struct.pack("<iiiidd", len(V), len(F), int(iterations), int(threads),
+                    float(min_thickness), float(max_wall)),
+        V_rest, V, F)
+    walls, before, after, moved, passes, n = struct.unpack_from("<6i", payload)
+    (max_move,) = struct.unpack_from("<d", payload, 24)
+    V_out = np.frombuffer(payload, dtype=np.float64, count=3 * n, offset=32).reshape(n, 3).copy()
+    return V_out, dict(walls=walls, crossed_before=before, crossed_after=after,
+                       moved=moved, passes=passes, max_move=max_move)

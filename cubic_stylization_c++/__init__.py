@@ -86,6 +86,48 @@ def get_pin_indices(ob):
             if any(g.group == gi for g in v.groups)]
 
 
+# Shape before the last Cubify, kept on the mesh (hidden: leading dot) so
+# Fix Thin Walls can run later — it measures walls in the pre-cubify shape.
+REST_ATTR = ".cubify_rest"
+
+
+def store_rest(me, V):
+    a = me.attributes.get(REST_ATTR)
+    if a is not None and (a.domain != 'POINT' or a.data_type != 'FLOAT_VECTOR'):
+        me.attributes.remove(a)
+        a = None
+    if a is None:
+        me.attributes.new(REST_ATTR, 'FLOAT_VECTOR', 'POINT')
+    me.attributes[REST_ATTR].data.foreach_set(
+        "vector", np.asarray(V, dtype=np.float32).ravel())
+
+
+def read_rest(me):
+    """The stored pre-cubify positions, or None if missing or stale."""
+    a = me.attributes.get(REST_ATTR)
+    if (a is None or a.domain != 'POINT' or a.data_type != 'FLOAT_VECTOR'
+            or len(a.data) != len(me.vertices)):
+        return None
+    V = np.empty(len(me.vertices) * 3, dtype=np.float32)
+    a.data.foreach_get("vector", V)
+    return V.reshape(-1, 3).astype(np.float64)
+
+
+def fix_walls(context, V_rest, V, F, min_thickness=0.1, iterations=60):
+    props = context.scene.cubify_cpp_settings
+    return client.fix_thin_walls(V_rest, V, F, min_thickness=min_thickness,
+                                 iterations=iterations, threads=props.threads,
+                                 server_path=server_path(context))
+
+
+def walls_note(st):
+    if st["crossed_before"] == 0 and st["moved"] == 0:
+        return "no thin-wall crossings"
+    return (f"thin walls: {st['crossed_before']} crossed points -> "
+            f"{st['crossed_after']} ({st['moved']} vertices moved, "
+            f"max {st['max_move']:.3g})")
+
+
 def addon_prefs(context=None):
     context = context or bpy.context
     addon = context.preferences.addons.get(__package__)
@@ -97,11 +139,20 @@ def server_path(context=None):
     return client.resolve_server_path(prefs.server_path if prefs else "")
 
 
-def create_stylizer(context, V, F, cubeness, A, pins):
+def flat_relax(props):
+    """Edge-weight factor for Square Flat Regions (1 = off). Strength 1
+    gives 0.01, the value the feature was tuned with."""
+    if not props.square_flat:
+        return 1.0
+    return 1.0 - 0.99 * props.square_flat_strength
+
+
+def create_stylizer(context, V, F, cubeness, A, pins, allow_square_flat=True):
     props = context.scene.cubify_cpp_settings
     return client.create_stylizer(V, F, cubeness=cubeness, cube_axes=A, pins=pins,
                                   threads=props.threads,
-                                  server_path=server_path(context))
+                                  server_path=server_path(context),
+                                  flat_relax=flat_relax(props) if allow_square_flat else 1.0)
 
 
 def cube_axes(props):
@@ -129,6 +180,13 @@ class CubifyCppSettings(bpy.types.PropertyGroup):
         description="Maximum inner ADMM iterations per rotation fit "
                     "(stops early on convergence)",
         default=100, min=1, max=300)
+    repeat: bpy.props.IntProperty(
+        name="Repeat",
+        description="Cubify this many times in a row, each pass starting from "
+                    "the previous result (same as pressing Cubify again). The "
+                    "style compounds: stronger than raising Cubeness on "
+                    "detailed shapes. Cubify Mesh only; time scales with it",
+        default=1, min=1, max=20)
     apply_to_copy: bpy.props.BoolProperty(
         name="Apply to Copy",
         description="Cubify a duplicate and keep the original object unchanged",
@@ -170,6 +228,23 @@ class CubifyCppSettings(bpy.types.PropertyGroup):
                     "bakes start at the current frame; Cubify Every Frame "
                     "samples the scene frame range at this step",
         default=2, min=1, max=50)
+    square_flat: bpy.props.BoolProperty(
+        name="Square Flat Regions",
+        description="Let surfaces that already face a cube axis (lids, plates, "
+                    "flat tops) reshape in-plane so their round outlines turn "
+                    "square. Goes beyond the paper's method; about 3x slower. "
+                    "Not used while dragging pins",
+        default=False)
+    square_flat_strength: bpy.props.FloatProperty(
+        name="Strength",
+        description="How freely flat regions may reshape (0 = no effect)",
+        default=1.0, min=0.0, max=1.0, subtype='FACTOR')
+    auto_fix_walls: bpy.props.BoolProperty(
+        name="Auto-fix Thin Walls",
+        description="After Cubify and for every baked step, push apart thin "
+                    "walls (e.g. the inner and outer surface of a spout) that "
+                    "cubification made cross each other",
+        default=False)
     threads: bpy.props.IntProperty(
         name="Threads",
         description="CPU threads the C++ solver uses (0 = all cores)",
@@ -239,34 +314,100 @@ class OBJECT_OT_cubify_cpp(bpy.types.Operator):
 
         wm = context.window_manager
         t0 = time.time()
-        stylizer = None
-        try:
-            stylizer, device, _ = create_stylizer(context, V, F, props.cubeness,
-                                                  cube_axes(props), pins)
-            V_out = stylizer.run(
-                iterations=props.iterations,
-                admm_iters=props.admm_iterations,
-                on_progress=lambda i, total: wm.progress_update(
-                    int(100 * (base + span * i / total))))
-        except Exception as exc:
-            self.report({'ERROR'}, f"{ob.name}: solver failed ({exc})")
-            return False
-        finally:
-            if stylizer is not None:
-                stylizer.close()
+        passes = props.repeat
+        V_out = V
+        for p in range(passes):
+            # each pass cubifies the previous result as its new rest pose —
+            # the same as pressing Cubify again, so the style compounds
+            def progress(i, total, p=p):
+                wm.progress_update(int(100 * (base + span * (p + i / total) / passes)))
+            stylizer = None
+            try:
+                stylizer, device, _ = create_stylizer(context, V_out, F, props.cubeness,
+                                                      cube_axes(props), pins)
+                V_out = stylizer.run(iterations=props.iterations,
+                                     admm_iters=props.admm_iterations,
+                                     on_progress=progress)
+            except Exception as exc:
+                self.report({'ERROR'}, f"{ob.name}: solver failed ({exc})")
+                return False
+            finally:
+                if stylizer is not None:
+                    stylizer.close()
 
-        if not np.all(np.isfinite(V_out)):
-            self.report({'ERROR'}, f"{ob.name}: solver produced invalid positions")
-            return False
+            if not np.all(np.isfinite(V_out)):
+                self.report({'ERROR'}, f"{ob.name}: solver produced invalid positions")
+                return False
 
+        fix_note = ""
+        if props.auto_fix_walls:
+            try:
+                V_out, st = fix_walls(context, V, V_out, F)
+                fix_note = "; " + walls_note(st)
+            except Exception as exc:
+                self.report({'WARNING'}, f"{ob.name}: thin-wall fix failed ({exc})")
+
+        store_rest(me, V)  # for a later Fix Thin Walls
         write_mesh_positions(me, V_out)
 
         note = f", {len(pins)} pinned" if pins else ""
+        if passes > 1:
+            note += f", x{passes} passes"
         self.report({'INFO'},
                     f"{ob.name} ({kind.lower()}): cubified {len(V)} vertices in "
                     f"{time.time() - t0:.2f}s on {device} "
-                    f"(lambda={props.cubeness:.2f}{note})")
+                    f"(lambda={props.cubeness:.2f}{note}){fix_note}")
         return True
+
+
+class OBJECT_OT_cubify_cpp_fix_thin_walls(bpy.types.Operator):
+    """Push apart thin walls that the last Cubify made cross each other
+    (e.g. the inner surface of a hollow spout poking through the outer one).
+    Walls are measured in the shape from before that Cubify, which Cubify
+    stores on the mesh"""
+    bl_idname = "object.cubify_cpp_fix_thin_walls"
+    bl_label = "Fix Thin Walls"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    min_thickness: bpy.props.FloatProperty(
+        name="Min Thickness",
+        description="Walls thinner than this fraction of their original "
+                    "thickness (or crossed) are pushed back to it",
+        default=0.1, min=0.0, max=1.0, subtype='FACTOR')
+    iterations: bpy.props.IntProperty(
+        name="Iterations", description="Maximum push-apart passes",
+        default=60, min=1, max=500)
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
+
+    def execute(self, context):
+        targets = [ob for ob in context.selected_objects if ob.type == 'MESH']
+        if not targets and context.active_object and context.active_object.type == 'MESH':
+            targets = [context.active_object]
+        done = 0
+        for ob in targets:
+            me = ob.data
+            V_rest = read_rest(me)
+            if V_rest is None:
+                self.report({'WARNING'},
+                            f"{ob.name}: skipped (no pre-cubify shape stored — "
+                            "cubify it with this add-on first)")
+                continue
+            V, F = read_mesh_arrays(me)
+            try:
+                V_out, st = fix_walls(context, V_rest, V, F,
+                                      min_thickness=self.min_thickness,
+                                      iterations=self.iterations)
+            except Exception as exc:
+                self.report({'ERROR'}, f"{ob.name}: thin-wall fix failed ({exc})")
+                continue
+            write_mesh_positions(me, V_out)
+            self.report({'INFO'}, f"{ob.name}: {walls_note(st)}")
+            done += 1
+        return {'FINISHED'} if done else {'CANCELLED'}
 
 
 # ================== Style-as-process animation bake
@@ -356,6 +497,15 @@ class OBJECT_OT_cubify_cpp_bake_anim(bpy.types.Operator):
                 if not np.all(np.isfinite(V)):
                     self.report({'ERROR'}, f"{ob.name}: invalid positions at step {k}")
                     return False
+                if props.auto_fix_walls:
+                    # only the baked key is fixed; the solver keeps
+                    # warm-starting from its own unfixed result
+                    try:
+                        V, _ = fix_walls(context, V0, V, F)
+                    except Exception as exc:
+                        self.report({'ERROR'},
+                                    f"{ob.name}: thin-wall fix failed at step {k} ({exc})")
+                        return False
                 results.append(V)
                 wm.progress_update(int(100 * (base + span * k / steps)))
         finally:
@@ -503,7 +653,9 @@ class OBJECT_OT_cubify_cpp_bake_frames(bpy.types.Operator):
                                            admm_iters=props.admm_iterations)
                 if not np.all(np.isfinite(V_out)):
                     raise RuntimeError(f"invalid positions at frame {f}")
-                V_prev = V_out
+                V_prev = V_out  # warm start from the unfixed solve
+                if props.auto_fix_walls:
+                    V_out, _ = fix_walls(context, Vw, V_out, F)
 
                 kb = new_ob.shape_key_add(name=f"Frame {f:04d}", from_mix=False)
                 kb.interpolation = 'KEY_LINEAR'
@@ -623,8 +775,11 @@ class OBJECT_OT_arap_cpp_manipulate(bpy.types.Operator):
 
         try:
             # factorized once here; every drag only re-solves on the server
+            # (Square Flat Regions would refactorize every iteration, so it
+            # stays off for interactive drags)
             self.solver, device, _ = create_stylizer(context, V, F, lam,
-                                                     cube_axes(props), pins)
+                                                     cube_axes(props), pins,
+                                                     allow_square_flat=False)
         except Exception as exc:
             self.report({'ERROR'}, f"Solver setup failed ({exc})")
             return {'CANCELLED'}
@@ -800,10 +955,20 @@ class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
         col.prop(props, "cubeness")
         col.prop(props, "iterations")
         col.prop(props, "admm_iterations")
+        col.prop(props, "repeat")
+        row = layout.row(align=True)
+        row.prop(props, "square_flat")
+        sub = row.row(align=True)
+        sub.active = props.square_flat
+        sub.prop(props, "square_flat_strength")
         layout.prop(props, "threads")
         layout.prop(props, "orientation")
         layout.prop(props, "apply_to_copy")
         layout.operator(OBJECT_OT_cubify_cpp.bl_idname, icon='MESH_CUBE')
+        row = layout.row(align=True)
+        row.prop(props, "auto_fix_walls")
+        row.operator(OBJECT_OT_cubify_cpp_fix_thin_walls.bl_idname, text="Fix Now",
+                     icon='MOD_SOLIDIFY')
 
         layout.separator()
         box = layout.box()
@@ -961,7 +1126,8 @@ class CubifyCppPreferences(bpy.types.AddonPreferences):
 
 # ================== Registration
 
-_classes = (CubifyCppSettings, OBJECT_OT_cubify_cpp, OBJECT_OT_cubify_cpp_bake_anim,
+_classes = (CubifyCppSettings, OBJECT_OT_cubify_cpp, OBJECT_OT_cubify_cpp_fix_thin_walls,
+            OBJECT_OT_cubify_cpp_bake_anim,
             OBJECT_OT_cubify_cpp_bake_frames, OBJECT_OT_cubify_cpp_pins,
             OBJECT_OT_arap_cpp_manipulate, VIEW3D_PT_cubify_cpp,
             CUBIFY_CPP_OT_check_server, CUBIFY_CPP_OT_build_server,

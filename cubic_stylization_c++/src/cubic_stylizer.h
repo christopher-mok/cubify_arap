@@ -12,6 +12,18 @@
 // Vertices may be pinned to prescribed positions ("handles"). The system
 // matrix depends only on the pin *set*, so it is factorized once and pins can
 // then be dragged interactively: each drag only rebuilds the right-hand side.
+//
+// Two extensions beyond the paper:
+//  - Disconnected parts. The energy does not couple separate parts, so each
+//    part without pins is placed by translation after every iteration: a
+//    part touching already-placed geometry keeps its contact offsets (a lid
+//    stays seated on its pot), otherwise the largest part keeps its rest
+//    centroid. Translations never change a part's shape.
+//  - Square flat regions (optional, flat_relax < 1). Surfaces that already
+//    face a cube axis count as perfectly cubic, so a flat disc keeps its
+//    round outline. Scaling the ARAP weight of edges inside such regions by
+//    flat_relax (re-evaluated every iteration) lets them reshape in-plane,
+//    so their rims can straighten into square outlines.
 
 #pragma once
 
@@ -39,8 +51,11 @@ class CubicStylizer {
   // quad/n-gon mesh works fine: only vertex positions are solved for);
   // cube_axes: rotation whose columns are the target cube axes;
   // pins: vertex indices to constrain (duplicates are fine).
+  // flat_relax: edge-weight factor inside axis-aligned regions, in (0, 1];
+  // 1 disables the square-flat-regions extension.
   CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cubeness,
-                const Eigen::Matrix3d& cube_axes, const std::vector<int32_t>& pins);
+                const Eigen::Matrix3d& cube_axes, const std::vector<int32_t>& pins,
+                double flat_relax = 1.0);
 
   // Local-global iterations; returns the (n, 3) positions.
   //   pin_pos: (pins().size(), 3) targets for the pinned vertices, or null to
@@ -49,10 +64,6 @@ class CubicStylizer {
   RowMatX3d solve(const RowMatX3d* pin_pos, const RowMatX3d* V_init, int iterations,
                   int admm_iters, ThreadPool& pool, const ProgressFn& on_progress = nullptr,
                   int* iterations_done = nullptr);
-
-  // Keep the result centred where the input was (one-shot stylization with
-  // nothing pinned: the energy is translation-invariant).
-  void recenter(RowMatX3d& V) const;
 
   int num_vertices() const { return n_; }
   const std::vector<int32_t>& pins() const { return pins_; }
@@ -63,10 +74,13 @@ class CubicStylizer {
   void build_edges();
   void build_normals_and_areas();
   void build_solver();
+  void build_part_placement(const std::vector<int32_t>& comp, const std::vector<char>& pinned);
+  void factorize(bool analyze);
+  void reweight_flat_regions(const RowMatX3d& V);
+  void restore_base_weights();
+  void place_floating_parts(RowMatX3d& V) const;
   void local_step(const RowMatX3d& V, int admm_iters, ThreadPool& pool);
   RowMatX3d global_step(const RowMatX3d& ppos, ThreadPool& pool);
-  std::vector<Eigen::Vector3d> centroids(const RowMatX3d& V) const;
-  void keep_floating_centroids(RowMatX3d& V) const;
 
   RowMatX3d V0_;
   RowMatX3i F_;
@@ -78,6 +92,10 @@ class CubicStylizer {
   // directed one-ring edges in CSR order: row i holds every spoke i -> j
   std::vector<int32_t> row_start_, col_;
   std::vector<double> w_, deg_;
+  std::vector<double> w_base_;  // cotan weights before flat-region relaxing
+  double flat_relax_;
+  bool weights_relaxed_ = false;
+  bool has_iterated_ = false;  // flat regions are only relaxed after one plain iteration
   std::vector<Eigen::Vector3d> e0_;  // rest-pose edge vectors V0_i - V0_j
 
   std::vector<Eigen::Vector3d> nhat_;
@@ -86,11 +104,17 @@ class CubicStylizer {
   // Global step: pinned rows become identity and edges into pins move to
   // the right-hand side, giving a symmetric positive definite system.
   std::vector<char> anchored_;
-  // connected components with no pin: index per vertex (-1 = held by a pin
-  // or loose) and rest-pose centroid per component
-  std::vector<int32_t> floating_;
-  int num_floating_ = 0;
-  std::vector<Eigen::Vector3d> float_rest_centroid_;
+
+  // Parts without pins, in placement order (see place_floating_parts).
+  struct Part {
+    std::vector<int32_t> verts;
+    bool by_contact = false;
+    Eigen::Vector3d rest_centroid = Eigen::Vector3d::Zero();
+    // (vertex of this part, nearest vertex of an earlier-placed part)
+    std::vector<std::pair<int32_t, int32_t>> contacts;
+    Eigen::Vector3d rest_offset = Eigen::Vector3d::Zero();  // mean V0_v - V0_u
+  };
+  std::vector<Part> parts_;
   Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> ldlt_;
   std::unique_ptr<Eigen::SparseLU<Eigen::SparseMatrix<double>>> lu_;  // fallback
 
