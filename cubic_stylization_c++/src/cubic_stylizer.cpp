@@ -20,8 +20,8 @@ constexpr double kTau = 2.0;
 constexpr double kEpsAbs = 1e-5;
 constexpr double kEpsRel = 1e-3;
 
-// Square flat regions: a vertex counts as axis-aligned when the cosine
-// between its normal and the nearest cube axis reaches kFlatHi (~8 deg),
+// Square flat regions: a vertex counts as aligned when the cosine between
+// its normal and the nearest target direction reaches kFlatHi (~8 deg),
 // ramping in from kFlatLo (~14 deg).
 constexpr double kFlatLo = 0.97;
 constexpr double kFlatHi = 0.99;
@@ -66,12 +66,14 @@ struct UnionFind {
 
 CubicStylizer::CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cubeness,
                              const Eigen::Matrix3d& cube_axes,
-                             const std::vector<int32_t>& pins, double flat_relax)
+                             const std::vector<int32_t>& pins, double flat_relax,
+                             int32_t target, double roundness)
     : V0_(V),
       F_(F),
       n_(static_cast<int>(V.rows())),
       lam_(cubeness),
       A_(cube_axes),
+      target_(target, roundness),
       flat_relax_(std::clamp(flat_relax, 1e-4, 1.0)) {
   if (n_ == 0 || F_.rows() == 0) throw std::invalid_argument("mesh has no vertices or faces");
   if (F_.minCoeff() < 0 || F_.maxCoeff() >= n_)
@@ -384,12 +386,12 @@ void CubicStylizer::reweight_flat_regions(const RowMatX3d& V) {
     nrm[b] += fn;
     nrm[c] += fn;
   }
-  // g = 1 where the vertex normal faces a cube axis, 0 where it does not
+  // g = 1 where the vertex normal faces a target direction, 0 where it does not
   std::vector<double> g(n_, 0.0);
   for (int i = 0; i < n_; ++i) {
     const double len = nrm[i].norm();
     if (len < 1e-12) continue;
-    const double al = (A_.transpose() * nrm[i] / len).cwiseAbs().maxCoeff();
+    const double al = target_.alignment(A_.transpose() * nrm[i] / len);
     g[i] = std::clamp((al - kFlatLo) / (kFlatHi - kFlatLo), 0.0, 1.0);
   }
   for (int i = 0; i < n_; ++i) {
@@ -457,7 +459,7 @@ void CubicStylizer::local_step(const RowMatX3d& V, int admm_iters, ThreadPool& p
       Eigen::Vector3d& z = z_[i];
       Eigen::Vector3d& u = u_[i];
       double& rho = rho_[i];
-      const double k = lam * area_[i];  // weight of the L1 term
+      const double k = lam * area_[i];  // weight of the stylization term
 
       for (int it = 0; it < admm_iters; ++it) {
         // R-step: Procrustes on M = S + rho * n (A(z-u))^T
@@ -465,15 +467,11 @@ void CubicStylizer::local_step(const RowMatX3d& V, int admm_iters, ThreadPool& p
         const Eigen::Matrix3d R = fit_rotation(M);
         R_[i] = R;
 
-        // z-step: soft-threshold A^T R n
+        // z-step: proximal step of the target term at A^T R n + u
+        // (soft-thresholding for the cube)
         const Eigen::Vector3d Rn = A_.transpose() * (R * nh);
         const Eigen::Vector3d x = Rn + u;
-        const double thr = k / rho;
-        Eigen::Vector3d z_new;
-        for (int c = 0; c < 3; ++c) {
-          double mag = std::max(std::abs(x[c]) - thr, 0.0);
-          z_new[c] = x[c] > 0.0 ? mag : (x[c] < 0.0 ? -mag : 0.0);
-        }
+        const Eigen::Vector3d z_new = target_.prox(x, k / rho);
 
         // scaled dual update
         Eigen::Vector3d u_new = u + Rn - z_new;

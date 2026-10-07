@@ -1,9 +1,10 @@
 # Cubic Stylization / ARAP solver (Liu & Jacobson, SIGGRAPH Asia 2019), pure numpy.
 #
-# Minimizes the ARAP energy plus the L1 cubeness term
+# Minimizes the ARAP energy plus the stylization term
 #     sum_i sum_{j in N(i)} (w_ij / 2) ||R_i d_ij - d'_ij||^2
-#   + sum_i lambda * a_i * ||A^T R_i n_i||_1
-# with local-global iterations. With cubeness = 0 this is classic ARAP. The
+#   + sum_i lambda * a_i * f(A^T R_i n_i)
+# with local-global iterations, where f is the target shape's term (the
+# paper's L1 norm for the cube; see "target shapes" below). With cubeness = 0 this is classic ARAP. The
 # local (rotation) step is a per-vertex ADMM (Algorithm 1 of the paper) batched
 # over all vertices with numpy (a plain batched Procrustes when cubeness = 0);
 # the global step is a cotan-Laplacian solve (scipy sparse LU when available,
@@ -32,6 +33,146 @@ def _det3(X):
             + X[:, 0, 2] * (X[:, 1, 0] * X[:, 2, 1] - X[:, 1, 1] * X[:, 2, 0]))
 
 
+# ================== target shapes
+#
+# For the faceted targets f is the support function of the polytope
+#     P = {y : d_k . y <= 1}
+# whose face normals d_k are the preferred normal directions. On the unit
+# sphere f is smallest (exactly 1) at the d_k, so surfaces snap to face them.
+# The cube's P is [-1, 1]^3, whose support function is the paper's L1 norm
+# and whose proximal step is soft-thresholding. For any support function the
+# proximal step follows from Moreau's identity,
+#     prox_{t f}(x) = x - t * proj_P(x / t),
+# with proj_P computed exactly by testing P's faces and edges.
+#
+# The rounded cube uses f(y) = sum_c |y_c|^p, 1 < p < 2, instead: it pulls
+# normals toward the cube axes without ever snapping them exactly, which
+# rounds edges and corners (p near 1 is almost the cube, p near 2 almost a
+# sphere). Roundness r in [0, 1] maps to p = 2 - 0.5 * 10^-r, which spaces
+# the look evenly. Its proximal step solves w^q + t p w = |x| for
+# w = |z|^(p-1), q = 1 / (p - 1): convex in w, so Newton's method from
+# w = |x|^(p-1) descends monotonically onto the root.
+#
+# Must match cubic_stylization_c++/src/target_shape.h.
+
+TARGETS = ('CUBE', 'OCTAHEDRON', 'PYRAMID', 'HEX_COLUMN', 'ROUNDED_CUBE')
+
+# Pyramid side-face normals sit this far above the horizon: the faces slope
+# at ~52 degrees, like the Great Pyramid.
+_PYRAMID_NORMAL_ELEVATION_DEG = 38.0
+
+_POLYTOPES = {}
+
+
+def rounded_exponent(roundness):
+    return 2.0 - 0.5 * 10.0 ** (-min(max(float(roundness), 0.0), 1.0))
+
+
+def target_directions(target):
+    """(K, 3) unit normals the target's surfaces snap to (target frame)."""
+    if target in ('CUBE', 'ROUNDED_CUBE'):
+        return np.concatenate([np.eye(3), -np.eye(3)])
+    if target == 'OCTAHEDRON':
+        s = np.array([1.0, -1.0])
+        return np.stack(np.meshgrid(s, s, s, indexing='ij'), -1).reshape(-1, 3) / np.sqrt(3.0)
+    if target == 'PYRAMID':
+        a = np.radians(_PYRAMID_NORMAL_ELEVATION_DEG)
+        c, s = np.cos(a), np.sin(a)
+        return np.array([[c, 0, s], [-c, 0, s], [0, c, s], [0, -c, s], [0, 0, -1.0]])
+    if target == 'HEX_COLUMN':
+        k = np.arange(6) * np.pi / 3.0
+        side = np.stack([np.cos(k), np.sin(k), np.zeros(6)], -1)
+        return np.concatenate([side, [[0, 0, 1.0], [0, 0, -1.0]]])
+    raise ValueError(f"unknown target shape {target!r}")
+
+
+def _polytope(target):
+    """(D, edge_start, edge_end) of P for a faceted target: vertices from
+    every triple of face planes; an edge joins two vertices sharing at least
+    two tight faces."""
+    if target not in _POLYTOPES:
+        D = target_directions(target)
+        verts, tight = [], []
+        K = len(D)
+        for i in range(K):
+            for j in range(i + 1, K):
+                for k in range(j + 1, K):
+                    M = D[[i, j, k]]
+                    if abs(np.linalg.det(M)) < 1e-9:
+                        continue
+                    v = np.linalg.solve(M, np.ones(3))
+                    if np.any(D @ v > 1.0 + 1e-9):
+                        continue
+                    if any(np.linalg.norm(w - v) < 1e-9 for w in verts):
+                        continue
+                    verts.append(v)
+                    tight.append(set(np.flatnonzero(np.abs(D @ v - 1.0) < 1e-9)))
+        ea, eb = [], []
+        for a in range(len(verts)):
+            for b in range(a + 1, len(verts)):
+                if len(tight[a] & tight[b]) >= 2:
+                    ea.append(verts[a])
+                    eb.append(verts[b])
+        _POLYTOPES[target] = (D, np.array(ea), np.array(eb))
+    return _POLYTOPES[target]
+
+
+def _project_polytope(Y, D, ea, eb):
+    """Euclidean projection of the rows of Y onto P = {y : D y <= 1}: the
+    nearest of the face-plane projections that land inside P and the clamped
+    edge-segment projections."""
+    out = Y.copy()
+    outside = (Y @ D.T).max(axis=1) > 1.0
+    if not np.any(outside):
+        return out
+    y = Y[outside]
+    C = y[:, None, :] - (y @ D.T - 1.0)[:, :, None] * D[None]          # (m, K, 3)
+    lim = 1.0 + 1e-9 * np.maximum(1.0, np.linalg.norm(C, axis=2))
+    inside = np.all(C @ D.T <= lim[:, :, None], axis=2)
+    d2f = np.where(inside, ((C - y[:, None]) ** 2).sum(axis=2), np.inf)
+    ab = eb - ea
+    s = np.clip(((y[:, None] - ea[None]) * ab[None]).sum(axis=2) / (ab ** 2).sum(axis=1), 0.0, 1.0)
+    CE = ea[None] + s[:, :, None] * ab[None]                           # (m, E, 3)
+    d2e = ((CE - y[:, None]) ** 2).sum(axis=2)
+    cand = np.concatenate([C, CE], axis=1)
+    pick = np.argmin(np.concatenate([d2f, d2e], axis=1), axis=1)
+    out[outside] = cand[np.arange(len(y)), pick]
+    return out
+
+
+def target_prox(target, X, t, p=1.75):
+    """Proximal step of t_i * f at the rows x_i of X (t >= 0); p is the
+    rounded cube's exponent."""
+    if target == 'CUBE':
+        return np.sign(X) * np.maximum(np.abs(X) - t[:, None], 0.0)
+    if target == 'ROUNDED_CUBE':
+        Z = X.copy()
+        m = t > 1e-12
+        a = np.abs(X[m])
+        tp = t[m, None] * p
+        q = 1.0 / (p - 1.0)
+        w = a ** (p - 1.0)
+        for _ in range(50):
+            step = (w ** q + tp * w - a) / (q * w ** (q - 1.0) + tp)
+            w -= step
+            if np.all(np.abs(step) <= 1e-15 * np.maximum(1.0, w)):
+                break
+        Z[m] = np.sign(X[m]) * np.maximum(w, 0.0) ** q
+        return Z
+    D, ea, eb = _polytope(target)
+    Z = X.copy()
+    m = t > 1e-12
+    tm = t[m, None]
+    Z[m] = X[m] - tm * _project_polytope(X[m] / tm, D, ea, eb)
+    return Z
+
+
+def target_alignment(target, Y):
+    """Cosine between each unit row of Y (target frame) and the nearest
+    preferred direction: 1 when it faces one exactly."""
+    return (Y @ target_directions(target).T).max(axis=1)
+
+
 # ADMM constants from the paper
 _RHO_INIT = 1e-4
 _MU = 10.0
@@ -46,12 +187,19 @@ class CubicStylizer:
     V : (n, 3) float array of rest-pose vertex positions
     F : (m, 3) int array of triangle indices (a virtual triangulation of a
         quad/n-gon mesh works fine: only vertex positions are solved for)
-    cubeness : lambda, strength of the L1 term (0 = classic ARAP)
+    cubeness : lambda, strength of the stylization term (0 = classic ARAP)
     cube_axes : (3, 3) rotation matrix A whose columns are the target cube axes
     pins : optional iterable of vertex indices to constrain ("handles")
+    target : one of TARGETS, the shape surfaces are stylized toward
+    roundness : 0..1, rounded cube only (0 is nearly the cube)
     """
 
-    def __init__(self, V, F, cubeness=0.2, cube_axes=None, pins=None):
+    def __init__(self, V, F, cubeness=0.2, cube_axes=None, pins=None,
+                 target='CUBE', roundness=0.5):
+        self.target = str(target).upper()
+        if self.target not in TARGETS:
+            raise ValueError(f"unknown target shape {target!r}")
+        self.p = rounded_exponent(roundness)
         self.V0 = np.asarray(V, dtype=np.float64).reshape(-1, 3)
         self.F = np.asarray(F, dtype=np.int64).reshape(-1, 3)
         self.n = len(self.V0)
@@ -257,7 +405,7 @@ class CubicStylizer:
         R_all = np.tile(np.eye(3), (n, 1, 1))
         act = np.arange(n)  # vertices whose ADMM has not converged yet
         z, u, rho = self.z, self.u, self.rho
-        k = self.lam * self.area  # weight of the L1 term per vertex
+        k = self.lam * self.area  # weight of the stylization term per vertex
 
         for _ in range(admm_iters):
             zc, uc, rc = z[act], u[act], rho[act]
@@ -275,11 +423,11 @@ class CubicStylizer:
                 R[flip] = Vt[flip].transpose(0, 2, 1) @ Uf.transpose(0, 2, 1)
             R_all[act] = R
 
-            # z-step: soft-threshold A^T R n
+            # z-step: proximal step of the target term at A^T R n + u
+            # (soft-thresholding for the cube)
             Rn = np.einsum('nij,nj->ni', R, nh) @ A
             x = Rn + uc
-            thr = (k[act] / rc)[:, None]
-            z_new = np.sign(x) * np.maximum(np.abs(x) - thr, 0.0)
+            z_new = target_prox(self.target, x, k[act] / rc, self.p)
 
             # scaled dual update
             u_new = uc + Rn - z_new
@@ -425,10 +573,12 @@ def torch_device_info():
 
 
 def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None,
-                    device='AUTO'):
+                    device='AUTO', target='CUBE', roundness=0.5):
     """Build a stylizer on the requested device.
 
     device : 'AUTO' | 'CPU' | 'CUDA' | 'MPS'  (case-insensitive)
+    target : one of TARGETS; the GPU backend implements the cube only, so
+             other targets always run on the CPU
 
     Returns (stylizer, resolved_device, warning). `resolved_device` is the
     device actually used; `warning` is a human-readable string when the
@@ -458,9 +608,15 @@ def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None,
     else:  # 'CPU' or anything unrecognized
         resolved = 'CPU'
 
+    if resolved != 'CPU' and str(target).upper() != 'CUBE':
+        if req != 'AUTO':
+            warning = "the GPU solver supports the Cube target only; using CPU"
+        resolved = 'CPU'
+
     if resolved == 'CPU':
         s = CubicStylizer(V, F, cubeness=cubeness, cube_axes=cube_axes,
-                          pins=pins)
+                          pins=pins, target=target,
+                          roundness=roundness)
         return s, 'CPU', warning
 
     try:
@@ -474,5 +630,6 @@ def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None,
         return s, resolved, warning
     except Exception as exc:
         s = CubicStylizer(V, F, cubeness=cubeness, cube_axes=cube_axes,
-                          pins=pins)
+                          pins=pins, target=target,
+                          roundness=roundness)
         return s, 'CPU', f"{resolved} backend failed ({exc}); using CPU"

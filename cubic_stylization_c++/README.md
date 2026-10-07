@@ -81,7 +81,8 @@ Identical to the Python add-on (see its README), with these changes:
   the Python README's 163,842-vertex benchmark (10 iterations) takes 2.3 s
   here, against 4.0 s for its Metal GPU run (different machines).
 
-Everything else — Cubeness, Cube Orientation, Iterations / ADMM
+Everything else — Target Shape (Cube, Octahedron, Pyramid, Hex Column,
+Rounded Cube with Roundness), Cubeness, Cube Orientation, Iterations / ADMM
 Iterations, Apply to Copy, Style as Process (Cubeness Ramp / Iterations,
 Steps, Iterations / Step, Frame Step), Cubify Every Frame (to Copy) with
 its Cube Axes option (Object / World), Set /

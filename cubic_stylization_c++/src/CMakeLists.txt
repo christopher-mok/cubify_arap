@@ -46,6 +46,7 @@ add_executable(cubify_server
   cubic_stylizer.h
   protocol.h
   thin_walls.cpp
+  target_shape.h
   thin_walls.h
   thread_pool.h)
 target_link_libraries(cubify_server PRIVATE cubify_eigen Threads::Threads)

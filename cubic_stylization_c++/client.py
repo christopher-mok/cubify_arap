@@ -16,7 +16,10 @@ import threading
 
 import numpy as np
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
+
+# TargetShape codes (src/target_shape.h)
+TARGETS = ("CUBE", "OCTAHEDRON", "PYRAMID", "HEX_COLUMN", "ROUNDED_CUBE")
 
 (OP_HELLO, OP_CREATE, OP_SOLVE, OP_SET_LAMBDA, OP_SET_THREADS, OP_DESTROY, OP_SHUTDOWN,
  OP_FIX_THIN_WALLS) = range(8)
@@ -218,13 +221,18 @@ class RemoteStylizer:
     V : (n, 3) rest-pose positions; F : (m, 3) triangle indices
     cubeness : lambda (0 = classic ARAP); cube_axes : (3, 3) rotation
     pins : vertex indices to constrain; threads : 0 = all cores
-    flat_relax : edge-weight factor inside regions already facing a cube
-                 axis, in (0, 1]; < 1 lets flat parts square their outline
-                 (1 = off, the paper's energy)
+    flat_relax : edge-weight factor inside regions already facing a target
+                 direction, in (0, 1]; < 1 lets flat parts square their
+                 outline (1 = off, the paper's energy)
+    target : one of TARGETS (the shape surfaces are stylized toward)
+    roundness : 0..1, rounded cube only (0 is nearly the cube)
     """
 
     def __init__(self, server, V, F, cubeness=0.2, cube_axes=None, pins=None,
-                 threads=0, flat_relax=1.0):
+                 threads=0, flat_relax=1.0, target="CUBE", roundness=0.5):
+        target = str(target).upper()
+        if target not in TARGETS:
+            raise ValueError(f"unknown target shape {target!r}")
         V = _f64(V)
         F = np.ascontiguousarray(F, dtype=np.int32).reshape(-1, 3)
         A = np.eye(3) if cube_axes is None else np.asarray(cube_axes, dtype=np.float64)
@@ -235,8 +243,9 @@ class RemoteStylizer:
         self._lam = float(cubeness)
         payload = server.request(
             OP_CREATE,
-            struct.pack("<iiiidd", len(V), len(F), len(pins), int(threads), self._lam,
-                        float(flat_relax)),
+            struct.pack("<iiiiiddd", len(V), len(F), len(pins), int(threads),
+                        TARGETS.index(target), self._lam, float(flat_relax),
+                        float(roundness)),
             np.ascontiguousarray(A.reshape(3, 3), dtype=np.float64), V, F, pins)
         self.id, kp = struct.unpack_from("<Ii", payload)
         self.pins = np.frombuffer(payload, dtype=np.int32, count=kp, offset=8).astype(np.int64)
@@ -311,7 +320,7 @@ class RemoteStylizer:
 
 
 def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None, threads=0,
-                    server_path=None, flat_relax=1.0):
+                    server_path=None, flat_relax=1.0, target="CUBE", roundness=0.5):
     """Build a stylizer on the C++ server.
 
     Returns (stylizer, device_label, warning) like the Python add-on's
@@ -319,7 +328,8 @@ def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None, threads=0,
     """
     server = get_server(server_path)
     s = RemoteStylizer(server, V, F, cubeness=cubeness, cube_axes=cube_axes,
-                       pins=pins, threads=threads, flat_relax=flat_relax)
+                       pins=pins, threads=threads, flat_relax=flat_relax,
+                       target=target, roundness=roundness)
     used = threads if threads and threads > 0 else server.hardware_threads
     return s, f"C++ ({used} thread{'s' if used != 1 else ''})", None
 

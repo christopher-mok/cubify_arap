@@ -1,10 +1,11 @@
 // Cubic Stylization / ARAP solver (Liu & Jacobson, SIGGRAPH Asia 2019), C++/Eigen.
 //
 // A port of cubic_stylization/solver.py. Minimizes the ARAP energy plus the
-// L1 cubeness term
+// stylization term
 //     sum_i sum_{j in N(i)} (w_ij / 2) ||R_i d_ij - d'_ij||^2
-//   + sum_i lambda * a_i * ||A^T R_i n_i||_1
-// with local-global iterations. With cubeness = 0 this is classic ARAP. The
+//   + sum_i lambda * a_i * f(A^T R_i n_i)
+// with local-global iterations, where f is the target shape's term (the
+// paper's L1 norm for the cube; see target_shape.h). With cubeness = 0 this is classic ARAP. The
 // local step runs the paper's per-vertex ADMM (Algorithm 1), multithreaded
 // over vertices (a plain Procrustes fit when cubeness = 0); the global step
 // is a prefactorized sparse Cholesky (LDLT) solve of the cotan Laplacian.
@@ -20,7 +21,8 @@
 //    stays seated on its pot), otherwise the largest part keeps its rest
 //    centroid. Translations never change a part's shape.
 //  - Square flat regions (optional, flat_relax < 1). Surfaces that already
-//    face a cube axis count as perfectly cubic, so a flat disc keeps its
+//    face a target direction (a cube axis for the cube) count as perfectly
+//    stylized, so a flat disc keeps its
 //    round outline. Scaling the ARAP weight of edges inside such regions by
 //    flat_relax (re-evaluated every iteration) lets them reshape in-plane,
 //    so their rims can straighten into square outlines.
@@ -37,6 +39,7 @@
 #include <memory>
 #include <vector>
 
+#include "target_shape.h"
 #include "thread_pool.h"
 
 namespace cubify {
@@ -51,11 +54,13 @@ class CubicStylizer {
   // quad/n-gon mesh works fine: only vertex positions are solved for);
   // cube_axes: rotation whose columns are the target cube axes;
   // pins: vertex indices to constrain (duplicates are fine).
-  // flat_relax: edge-weight factor inside axis-aligned regions, in (0, 1];
-  // 1 disables the square-flat-regions extension.
+  // flat_relax: edge-weight factor inside regions already facing a target
+  // direction, in (0, 1]; 1 disables the square-flat-regions extension.
+  // target: TargetShape code (0 = cube); roundness in [0, 1] shapes the
+  // rounded cube only.
   CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cubeness,
                 const Eigen::Matrix3d& cube_axes, const std::vector<int32_t>& pins,
-                double flat_relax = 1.0);
+                double flat_relax = 1.0, int32_t target = 0, double roundness = 0.5);
 
   // Local-global iterations; returns the (n, 3) positions.
   //   pin_pos: (pins().size(), 3) targets for the pinned vertices, or null to
@@ -87,6 +92,7 @@ class CubicStylizer {
   int n_;
   double lam_;
   Eigen::Matrix3d A_;
+  Target target_;
   std::vector<int32_t> pins_;
 
   // directed one-ring edges in CSR order: row i holds every spoke i -> j

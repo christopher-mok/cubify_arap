@@ -152,7 +152,8 @@ def create_stylizer(context, V, F, cubeness, A, pins, allow_square_flat=True):
     return client.create_stylizer(V, F, cubeness=cubeness, cube_axes=A, pins=pins,
                                   threads=props.threads,
                                   server_path=server_path(context),
-                                  flat_relax=flat_relax(props) if allow_square_flat else 1.0)
+                                  flat_relax=flat_relax(props) if allow_square_flat else 1.0,
+                                  target=props.target_shape, roundness=props.roundness)
 
 
 def cube_axes(props):
@@ -171,14 +172,35 @@ def rotation_part(M):
 # ================== Settings
 
 class CubifyCppSettings(bpy.types.PropertyGroup):
+    target_shape: bpy.props.EnumProperty(
+        name="Target Shape",
+        description="The shape surfaces are stylized toward. Its axes follow "
+                    "Cube Orientation",
+        items=[
+            ('CUBE', "Cube", "Faces snap to the 6 axis directions "
+             "(the paper's cubic stylization)"),
+            ('OCTAHEDRON', "Octahedron", "Faces snap to the 8 diagonal "
+             "directions: crystal and gem facets"),
+            ('PYRAMID', "Pyramid", "Faces snap to 4 sides sloping at ~52 "
+             "degrees and a flat base; the apex points along +Z"),
+            ('HEX_COLUMN', "Hex Column", "Faces snap to 6 vertical sides plus "
+             "top and bottom: basalt columns, along Z"),
+            ('ROUNDED_CUBE', "Rounded Cube", "Pulls toward the cube axes without "
+             "snapping, rounding edges and corners (see Roundness)"),
+        ], default='CUBE')
+    roundness: bpy.props.FloatProperty(
+        name="Roundness",
+        description="Rounded Cube only: 0 is nearly a sharp cube, 1 a soft "
+                    "pillow close to a sphere",
+        default=0.5, min=0.0, max=1.0, subtype='FACTOR')
     cubeness: bpy.props.FloatProperty(
         name="Cubeness",
-        description="Strength of the L1 cubeness term (lambda). 0 is plain ARAP; "
-                    "0.2-1.0 gives increasingly sharp cubes",
+        description="Strength of the stylization term (lambda). 0 is plain "
+                    "ARAP; 0.2-1.0 gives an increasingly strong target shape",
         default=0.2, min=0.0, soft_max=5.0, max=20.0, step=1, precision=2)
     orientation: bpy.props.FloatVectorProperty(
         name="Cube Orientation",
-        description="Rotation of the target cube axes (in the object's local space)",
+        description="Rotation of the target shape's axes (in the object's local space)",
         subtype='EULER', default=(0.0, 0.0, 0.0))
     iterations: bpy.props.IntProperty(
         name="Iterations",
@@ -975,6 +997,9 @@ class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
             else:
                 box.label(text=f"Pins: {n_pins}", icon='PINNED')
 
+        layout.prop(props, "target_shape")
+        if props.target_shape == 'ROUNDED_CUBE':
+            layout.prop(props, "roundness", slider=True)
         col = layout.column(align=True)
         col.prop(props, "cubeness")
         col.prop(props, "iterations")

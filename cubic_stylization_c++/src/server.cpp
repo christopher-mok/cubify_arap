@@ -173,8 +173,10 @@ class Server {
     const int32_t m = in.get<int32_t>();
     const int32_t k = in.get<int32_t>();
     const int32_t threads = in.get<int32_t>();
+    const int32_t target = in.get<int32_t>();
     const double lam = in.get<double>();
     const double flat_relax = in.get<double>();
+    const double roundness = in.get<double>();
     if (n < 0 || m < 0 || k < 0) throw std::invalid_argument("negative array size");
 
     Eigen::Matrix<double, 3, 3, Eigen::RowMajor> A;
@@ -186,7 +188,8 @@ class Server {
     in.take(pins.data(), sizeof(int32_t) * static_cast<size_t>(k));
 
     auto s = std::make_unique<Session>();
-    s->stylizer = std::make_unique<CubicStylizer>(V, F, lam, Eigen::Matrix3d(A), pins, flat_relax);
+    s->stylizer = std::make_unique<CubicStylizer>(V, F, lam, Eigen::Matrix3d(A), pins, flat_relax,
+                                                  target, roundness);
     s->threads = threads;
 
     const uint32_t id = next_id_++;

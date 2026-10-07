@@ -99,14 +99,35 @@ def rotation_part(M):
 # ================== Settings
 
 class CubifySettings(bpy.types.PropertyGroup):
+    target_shape: bpy.props.EnumProperty(
+        name="Target Shape",
+        description="The shape surfaces are stylized toward. Its axes follow "
+                    "Cube Orientation",
+        items=[
+            ('CUBE', "Cube", "Faces snap to the 6 axis directions "
+             "(the paper's cubic stylization)"),
+            ('OCTAHEDRON', "Octahedron", "Faces snap to the 8 diagonal "
+             "directions: crystal and gem facets"),
+            ('PYRAMID', "Pyramid", "Faces snap to 4 sides sloping at ~52 "
+             "degrees and a flat base; the apex points along +Z"),
+            ('HEX_COLUMN', "Hex Column", "Faces snap to 6 vertical sides plus "
+             "top and bottom: basalt columns, along Z"),
+            ('ROUNDED_CUBE', "Rounded Cube", "Pulls toward the cube axes without "
+             "snapping, rounding edges and corners (see Roundness)"),
+        ], default='CUBE')
+    roundness: bpy.props.FloatProperty(
+        name="Roundness",
+        description="Rounded Cube only: 0 is nearly a sharp cube, 1 a soft "
+                    "pillow close to a sphere",
+        default=0.5, min=0.0, max=1.0, subtype='FACTOR')
     cubeness: bpy.props.FloatProperty(
         name="Cubeness",
-        description="Strength of the L1 cubeness term (lambda). 0 is plain ARAP; "
-                    "0.2-1.0 gives increasingly sharp cubes",
+        description="Strength of the stylization term (lambda). 0 is plain "
+                    "ARAP; 0.2-1.0 gives an increasingly strong target shape",
         default=0.2, min=0.0, soft_max=5.0, max=20.0, step=1, precision=2)
     orientation: bpy.props.FloatVectorProperty(
         name="Cube Orientation",
-        description="Rotation of the target cube axes (in the object's local space)",
+        description="Rotation of the target shape's axes (in the object's local space)",
         subtype='EULER', default=(0.0, 0.0, 0.0))
     iterations: bpy.props.IntProperty(
         name="Iterations",
@@ -251,7 +272,8 @@ class OBJECT_OT_cubify(bpy.types.Operator):
         try:
             stylizer, device, warn = solver.create_stylizer(
                 V, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
-                device=props.device)
+                device=props.device, target=props.target_shape,
+                roundness=props.roundness)
             if warn:
                 self.report({'WARNING'}, f"{ob.name}: {warn}")
             V_out = stylizer.run(
@@ -338,7 +360,8 @@ class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
         try:
             stylizer, device, warn = solver.create_stylizer(
                 V0, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
-                device=props.device)
+                device=props.device, target=props.target_shape,
+                roundness=props.roundness)
             if warn:
                 self.report({'WARNING'}, f"{ob.name}: {warn}")
         except Exception as exc:
@@ -490,7 +513,8 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
                 # bake would stop following the animation.
                 stylizer, device, warn = solver.create_stylizer(
                     Vw, F, cubeness=props.cubeness, cube_axes=A_f, pins=pins,
-                    device=props.device)
+                    device=props.device, target=props.target_shape,
+                    roundness=props.roundness)
                 if warn and not warned:
                     self.report({'WARNING'}, f"{ob.name}: {warn}")
                     warned = True
@@ -623,7 +647,8 @@ class OBJECT_OT_arap_manipulate(bpy.types.Operator):
         try:
             self.solver, device, warn = solver.create_stylizer(
                 V, F, cubeness=lam, cube_axes=A, pins=pins,
-                device=props.device)
+                device=props.device, target=props.target_shape,
+                roundness=props.roundness)
             if warn:
                 self.report({'WARNING'}, warn)
         except Exception as exc:
@@ -786,6 +811,9 @@ class VIEW3D_PT_cubify(bpy.types.Panel):
             else:
                 box.label(text=f"Pins: {n_pins}", icon='PINNED')
 
+        layout.prop(props, "target_shape")
+        if props.target_shape == 'ROUNDED_CUBE':
+            layout.prop(props, "roundness", slider=True)
         col = layout.column(align=True)
         col.prop(props, "cubeness")
         col.prop(props, "iterations")
@@ -807,6 +835,9 @@ class VIEW3D_PT_cubify(bpy.types.Panel):
             elif props.device == 'MPS' and not mps:
                 layout.label(text="MPS not available: will use CPU",
                              icon='ERROR')
+            elif props.device in {'CUDA', 'MPS'} and props.target_shape != 'CUBE':
+                layout.label(text="GPU supports Cube only: will use CPU",
+                             icon='INFO')
         layout.prop(props, "orientation")
         layout.prop(props, "apply_to_copy")
         layout.operator(OBJECT_OT_cubify.bl_idname, icon='MESH_CUBE')

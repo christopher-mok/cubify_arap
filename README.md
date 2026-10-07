@@ -78,16 +78,39 @@ benchmarked on this machine.
 
 1. 3D Viewport sidebar (**N**) → **Cubify** tab.
 2. Select one or more mesh objects (Object Mode) and adjust:
-   - **Cubeness** (λ) — strength of the cube prior. `0` is plain ARAP;
-     `0.2` gives a rounded-cube look; `1.0+` gives sharp cubes.
-   - **Cube Orientation** — Euler rotation of the target cube axes (object
-     space), for cubifying against a tilted frame.
+   - **Target Shape** — what surfaces are stylized toward (see below).
+   - **Cubeness** (λ) — strength of the stylization. `0` is plain ARAP;
+     `0.2` gives a soft look; `1.0+` gives a sharp target shape.
+   - **Cube Orientation** — Euler rotation of the target shape's axes
+     (object space), for stylizing against a tilted frame (and for pointing
+     the pyramid's apex or the hex column's axis, both along +Z).
    - **Iterations** / **ADMM Iterations** — outer and inner solver budgets
      (defaults are fine).
    - **Apply to Copy** — keep the original; cubify a `<name>_cubified`
      duplicate.
 3. Click **Cubify Mesh** (undo-supported). Pinned vertices, if any, are held
    in place during stylization.
+
+### Target Shapes
+
+| Target | Surfaces face… | Look |
+|---|---|---|
+| **Cube** | the 6 axis directions | the paper's cubic stylization |
+| **Octahedron** | the 8 diagonal directions | crystal / gem facets |
+| **Pyramid** | 4 sides sloping ~52° plus a flat base (apex +Z) | monumental, ancient |
+| **Hex Column** | 6 vertical sides plus top and bottom (axis Z) | basalt columns |
+| **Rounded Cube** | near the axes, without snapping | soft, pillowy cube |
+
+**Roundness** (Rounded Cube only): `0` is almost a sharp cube, `1` a soft
+pillow close to a sphere; `0.5` gives clearly rounded edges.
+
+All targets keep the rest of the tool intact: pins, Style as Process,
+Cubify Every Frame and Stylized Drag use the selected target. Because the
+energy leaves an object's overall rotation free, a mesh whose large flat
+areas sit between two preferred directions may turn as a whole (for
+example a head under Octahedron tips ~45° to put its face on a diagonal);
+counter-rotate with Cube Orientation or pin a few vertices to hold it.
+The GPU backend implements Cube only; other targets run on the CPU solver.
 
 ## Style as Process (animation bake)
 
@@ -176,10 +199,21 @@ rest pose.
 
 ## Method
 
-Minimizes `Σ_ij (w_ij/2)‖R_i d_ij − d′_ij‖² + Σ_i λ a_i ‖Aᵀ R_i n̂_i‖₁` by
+Minimizes `Σ_ij (w_ij/2)‖R_i d_ij − d′_ij‖² + Σ_i λ a_i f(Aᵀ R_i n̂_i)` by
 local-global iteration: the global step is a cotan-Laplacian solve with pinned
 vertices eliminated into the right-hand side, and the local rotation step is
 the paper's per-vertex ADMM (soft-thresholding + orthogonal Procrustes,
 penalty updates μ=10, τ=2, ρ₀=1e-4), batched over all vertices with numpy and
 warm-started across iterations. With λ = 0 the local step reduces to plain
 Procrustes and the method is exactly ARAP (Sorkine & Alexa 2007).
+
+`f` is the target shape's term. For the cube it is the paper's L1 norm. The
+other faceted targets generalize it: `f` is the support function of the
+polytope `P = {y : d_k·y ≤ 1}` whose face normals `d_k` are the preferred
+directions. On the unit sphere it is smallest (exactly 1) at the `d_k`, so
+surfaces snap to face them; the cube's `P` is `[−1, 1]³`, whose support
+function is L1. The ADMM's soft-threshold becomes the proximal step
+`x − t·proj_P(x/t)` (Moreau's identity), with the projection computed
+exactly from `P`'s faces and edges. The rounded cube uses
+`f(y) = Σ |y_c|^p` with `p = 2 − 0.5·10^(−roundness)` ∈ [1.5, 1.95], whose
+proximal step is a monotone Newton solve.
