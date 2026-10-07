@@ -115,6 +115,13 @@ class CubifySettings(bpy.types.PropertyGroup):
             ('ROUNDED_CUBE', "Rounded Cube", "Pulls toward the cube axes without "
              "snapping, rounding edges and corners (see Roundness)"),
         ], default='CUBE')
+    keep_orientation: bpy.props.BoolProperty(
+        name="Keep Orientation",
+        description="Stop the whole mesh from turning to line its large flat "
+                    "areas up with the target's faces (e.g. a head turning "
+                    "10-14 degrees under Cube or Octahedron): the shape is stylized in place. "
+                    "No effect with pins, which already hold the orientation",
+        default=False)
     roundness: bpy.props.FloatProperty(
         name="Roundness",
         description="Rounded Cube only: 0 is nearly a sharp cube, 1 a soft "
@@ -273,7 +280,8 @@ class OBJECT_OT_cubify(bpy.types.Operator):
             stylizer, device, warn = solver.create_stylizer(
                 V, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
                 device=props.device, target=props.target_shape,
-                roundness=props.roundness)
+                roundness=props.roundness,
+                keep_orientation=props.keep_orientation)
             if warn:
                 self.report({'WARNING'}, f"{ob.name}: {warn}")
             V_out = stylizer.run(
@@ -361,7 +369,8 @@ class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
             stylizer, device, warn = solver.create_stylizer(
                 V0, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
                 device=props.device, target=props.target_shape,
-                roundness=props.roundness)
+                roundness=props.roundness,
+                keep_orientation=props.keep_orientation)
             if warn:
                 self.report({'WARNING'}, f"{ob.name}: {warn}")
         except Exception as exc:
@@ -514,7 +523,8 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
                 stylizer, device, warn = solver.create_stylizer(
                     Vw, F, cubeness=props.cubeness, cube_axes=A_f, pins=pins,
                     device=props.device, target=props.target_shape,
-                    roundness=props.roundness)
+                    roundness=props.roundness,
+                    keep_orientation=props.keep_orientation)
                 if warn and not warned:
                     self.report({'WARNING'}, f"{ob.name}: {warn}")
                     warned = True
@@ -648,7 +658,8 @@ class OBJECT_OT_arap_manipulate(bpy.types.Operator):
             self.solver, device, warn = solver.create_stylizer(
                 V, F, cubeness=lam, cube_axes=A, pins=pins,
                 device=props.device, target=props.target_shape,
-                roundness=props.roundness)
+                roundness=props.roundness,
+                keep_orientation=props.keep_orientation)
             if warn:
                 self.report({'WARNING'}, warn)
         except Exception as exc:
@@ -839,6 +850,7 @@ class VIEW3D_PT_cubify(bpy.types.Panel):
                 layout.label(text="GPU supports Cube only: will use CPU",
                              icon='INFO')
         layout.prop(props, "orientation")
+        layout.prop(props, "keep_orientation")
         layout.prop(props, "apply_to_copy")
         layout.operator(OBJECT_OT_cubify.bl_idname, icon='MESH_CUBE')
 

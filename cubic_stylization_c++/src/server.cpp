@@ -174,6 +174,7 @@ class Server {
     const int32_t k = in.get<int32_t>();
     const int32_t threads = in.get<int32_t>();
     const int32_t target = in.get<int32_t>();
+    const int32_t keep_orientation = in.get<int32_t>();
     const double lam = in.get<double>();
     const double flat_relax = in.get<double>();
     const double roundness = in.get<double>();
@@ -189,7 +190,7 @@ class Server {
 
     auto s = std::make_unique<Session>();
     s->stylizer = std::make_unique<CubicStylizer>(V, F, lam, Eigen::Matrix3d(A), pins, flat_relax,
-                                                  target, roundness);
+                                                  target, roundness, keep_orientation != 0);
     s->threads = threads;
 
     const uint32_t id = next_id_++;

@@ -54,8 +54,9 @@ class TorchCubicStylizer(CubicStylizer):
     (numpy in, numpy out)."""
 
     def __init__(self, V, F, cubeness=0.2, cube_axes=None, pins=None,
-                 device='cuda'):
-        super().__init__(V, F, cubeness=cubeness, cube_axes=cube_axes, pins=pins)
+                 device='cuda', keep_orientation=False):
+        super().__init__(V, F, cubeness=cubeness, cube_axes=cube_axes, pins=pins,
+                         keep_orientation=keep_orientation)
         self.dev = torch.device(device)
         dt = torch.float32
         self.dt = dt
@@ -308,6 +309,23 @@ class TorchCubicStylizer(CubicStylizer):
 
     # ---------------- driver ----------------
 
+    def _t_remove_net_rotation(self, Vt):
+        """GPU version of CubicStylizer._remove_net_rotation; the 3x3 fit
+        runs on the CPU in float64."""
+        a = self.t_area
+        total = float(a.sum())
+        if total <= 0.0:
+            return Vt
+        c = (a @ Vt) / total
+        V0c = torch.as_tensor(self.V0 - self.area @ self.V0 / total,
+                              dtype=self.dt, device=self.dev)
+        H = (V0c.T @ (a[:, None] * (Vt - c))).double().cpu().numpy()
+        U, _, Wt = np.linalg.svd(H)
+        if np.linalg.det(Wt.T @ U.T) < 0:
+            U[:, 2] *= -1
+        R = torch.as_tensor(Wt.T @ U.T, dtype=self.dt, device=self.dev)
+        return (Vt - c) @ R + c
+
     def solve(self, pin_pos=None, V_init=None, iterations=30, admm_iters=100,
               on_progress=None):
         ppos = self.V0.copy()
@@ -324,6 +342,8 @@ class TorchCubicStylizer(CubicStylizer):
         for it in range(iterations):
             R = self._t_local_step(Vt, admm_iters)
             V_new = self._t_global_step(R, Vt, ppos_t)
+            if self.keep_orientation and len(self.pins) == 0:
+                V_new = self._t_remove_net_rotation(V_new)
             step = float((V_new - Vt).norm(dim=1).max())
             Vt = V_new
             if on_progress is not None:

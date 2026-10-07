@@ -16,7 +16,7 @@ import threading
 
 import numpy as np
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 # TargetShape codes (src/target_shape.h)
 TARGETS = ("CUBE", "OCTAHEDRON", "PYRAMID", "HEX_COLUMN", "ROUNDED_CUBE")
@@ -226,10 +226,12 @@ class RemoteStylizer:
                  outline (1 = off, the paper's energy)
     target : one of TARGETS (the shape surfaces are stylized toward)
     roundness : 0..1, rounded cube only (0 is nearly the cube)
+    keep_orientation : without pins, stop the mesh turning as a whole
     """
 
     def __init__(self, server, V, F, cubeness=0.2, cube_axes=None, pins=None,
-                 threads=0, flat_relax=1.0, target="CUBE", roundness=0.5):
+                 threads=0, flat_relax=1.0, target="CUBE", roundness=0.5,
+                 keep_orientation=False):
         target = str(target).upper()
         if target not in TARGETS:
             raise ValueError(f"unknown target shape {target!r}")
@@ -243,9 +245,9 @@ class RemoteStylizer:
         self._lam = float(cubeness)
         payload = server.request(
             OP_CREATE,
-            struct.pack("<iiiiiddd", len(V), len(F), len(pins), int(threads),
-                        TARGETS.index(target), self._lam, float(flat_relax),
-                        float(roundness)),
+            struct.pack("<iiiiiiddd", len(V), len(F), len(pins), int(threads),
+                        TARGETS.index(target), int(bool(keep_orientation)), self._lam,
+                        float(flat_relax), float(roundness)),
             np.ascontiguousarray(A.reshape(3, 3), dtype=np.float64), V, F, pins)
         self.id, kp = struct.unpack_from("<Ii", payload)
         self.pins = np.frombuffer(payload, dtype=np.int32, count=kp, offset=8).astype(np.int64)
@@ -320,7 +322,8 @@ class RemoteStylizer:
 
 
 def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None, threads=0,
-                    server_path=None, flat_relax=1.0, target="CUBE", roundness=0.5):
+                    server_path=None, flat_relax=1.0, target="CUBE", roundness=0.5,
+                    keep_orientation=False):
     """Build a stylizer on the C++ server.
 
     Returns (stylizer, device_label, warning) like the Python add-on's
@@ -329,7 +332,8 @@ def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None, threads=0,
     server = get_server(server_path)
     s = RemoteStylizer(server, V, F, cubeness=cubeness, cube_axes=cube_axes,
                        pins=pins, threads=threads, flat_relax=flat_relax,
-                       target=target, roundness=roundness)
+                       target=target, roundness=roundness,
+                       keep_orientation=keep_orientation)
     used = threads if threads and threads > 0 else server.hardware_threads
     return s, f"C++ ({used} thread{'s' if used != 1 else ''})", None
 

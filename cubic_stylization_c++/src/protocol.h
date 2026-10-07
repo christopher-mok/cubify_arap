@@ -16,7 +16,8 @@
 //   HELLO      -> int32 protocol_version, int32 hardware_threads, utf8 version
 //   CREATE     int32 n, int32 m, int32 k, int32 threads,
 //              int32 target (TargetShape: 0 cube, 1 octahedron, 2 pyramid,
-//              3 hex column, 4 rounded cube), f64 cubeness,
+//              3 hex column, 4 rounded cube), int32 keep_orientation (0/1),
+//              f64 cubeness,
 //              f64 flat_relax (1 = off, see CubicStylizer),
 //              f64 roundness (rounded cube only, 0..1),
 //              f64 A[9] (row-major cube axes), f64 V[3n], int32 F[3m],
@@ -43,7 +44,7 @@
 namespace cubify {
 namespace protocol {
 
-constexpr int32_t kVersion = 4;
+constexpr int32_t kVersion = 5;
 
 enum Op : uint32_t {
   kHello = 0,

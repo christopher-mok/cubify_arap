@@ -58,9 +58,12 @@ class CubicStylizer {
   // direction, in (0, 1]; 1 disables the square-flat-regions extension.
   // target: TargetShape code (0 = cube); roundness in [0, 1] shapes the
   // rounded cube only.
+  // keep_orientation: without pins, undo the mesh's net rotation after
+  // every global step (see remove_net_rotation).
   CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cubeness,
                 const Eigen::Matrix3d& cube_axes, const std::vector<int32_t>& pins,
-                double flat_relax = 1.0, int32_t target = 0, double roundness = 0.5);
+                double flat_relax = 1.0, int32_t target = 0, double roundness = 0.5,
+                bool keep_orientation = false);
 
   // Local-global iterations; returns the (n, 3) positions.
   //   pin_pos: (pins().size(), 3) targets for the pinned vertices, or null to
@@ -84,6 +87,7 @@ class CubicStylizer {
   void reweight_flat_regions(const RowMatX3d& V);
   void restore_base_weights();
   void place_floating_parts(RowMatX3d& V) const;
+  void remove_net_rotation(RowMatX3d& V) const;
   void local_step(const RowMatX3d& V, int admm_iters, ThreadPool& pool);
   RowMatX3d global_step(const RowMatX3d& ppos, ThreadPool& pool);
 
@@ -93,6 +97,7 @@ class CubicStylizer {
   double lam_;
   Eigen::Matrix3d A_;
   Target target_;
+  bool keep_orientation_;
   std::vector<int32_t> pins_;
 
   // directed one-ring edges in CSR order: row i holds every spoke i -> j

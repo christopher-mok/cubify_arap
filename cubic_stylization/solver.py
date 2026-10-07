@@ -192,10 +192,13 @@ class CubicStylizer:
     pins : optional iterable of vertex indices to constrain ("handles")
     target : one of TARGETS, the shape surfaces are stylized toward
     roundness : 0..1, rounded cube only (0 is nearly the cube)
+    keep_orientation : without pins, undo the mesh's net rotation after every
+                       global step (see _remove_net_rotation)
     """
 
     def __init__(self, V, F, cubeness=0.2, cube_axes=None, pins=None,
-                 target='CUBE', roundness=0.5):
+                 target='CUBE', roundness=0.5, keep_orientation=False):
+        self.keep_orientation = bool(keep_orientation)
         self.target = str(target).upper()
         if self.target not in TARGETS:
             raise ValueError(f"unknown target shape {target!r}")
@@ -514,6 +517,8 @@ class CubicStylizer:
         for it in range(iterations):
             R = self._local_step(V, admm_iters)
             V_new = self._global_step(R, V, ppos)
+            if self.keep_orientation and len(self.pins) == 0:
+                V_new = self._remove_net_rotation(V_new)
             step = np.max(np.linalg.norm(V_new - V, axis=1))
             V = V_new
             if on_progress is not None:
@@ -521,6 +526,27 @@ class CubicStylizer:
             if step < 1e-6 * bbox:
                 break
         return V
+
+    def _remove_net_rotation(self, V):
+        """Undo the area-weighted best-fit rotation from the rest pose.
+
+        ARAP is unchanged by a rotation of the whole mesh, so without pins the
+        stylization term alone decides the mesh's orientation and may turn it
+        as a whole (Suzanne's head turns 10-14 degrees under the cube or
+        octahedron). Undoing that rotation costs no ARAP energy and
+        makes the target shape come from reshaping."""
+        a = self.area
+        total = a.sum()
+        if total <= 0.0:
+            return V
+        c0 = a @ self.V0 / total
+        c = a @ V / total
+        H = (self.V0 - c0).T @ (a[:, None] * (V - c))
+        U, _, Vt = np.linalg.svd(H)
+        if np.linalg.det(Vt.T @ U.T) < 0:
+            U[:, 2] *= -1
+        R = Vt.T @ U.T                      # rest -> current
+        return (V - c) @ R + c              # rows: R^T (v - c) + c
 
     def run(self, iterations=30, admm_iters=100, on_progress=None, pin_pos=None):
         """One-shot stylization. Holds pinned vertices (if any) in place;
@@ -573,7 +599,8 @@ def torch_device_info():
 
 
 def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None,
-                    device='AUTO', target='CUBE', roundness=0.5):
+                    device='AUTO', target='CUBE', roundness=0.5,
+                    keep_orientation=False):
     """Build a stylizer on the requested device.
 
     device : 'AUTO' | 'CPU' | 'CUDA' | 'MPS'  (case-insensitive)
@@ -616,7 +643,7 @@ def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None,
     if resolved == 'CPU':
         s = CubicStylizer(V, F, cubeness=cubeness, cube_axes=cube_axes,
                           pins=pins, target=target,
-                          roundness=roundness)
+                          roundness=roundness, keep_orientation=keep_orientation)
         return s, 'CPU', warning
 
     try:
@@ -626,10 +653,10 @@ def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None,
             import solver_torch
         s = solver_torch.TorchCubicStylizer(
             V, F, cubeness=cubeness, cube_axes=cube_axes, pins=pins,
-            device=resolved.lower())
+            device=resolved.lower(), keep_orientation=keep_orientation)
         return s, resolved, warning
     except Exception as exc:
         s = CubicStylizer(V, F, cubeness=cubeness, cube_axes=cube_axes,
                           pins=pins, target=target,
-                          roundness=roundness)
+                          roundness=roundness, keep_orientation=keep_orientation)
         return s, 'CPU', f"{resolved} backend failed ({exc}); using CPU"

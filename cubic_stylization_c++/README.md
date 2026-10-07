@@ -82,7 +82,8 @@ Identical to the Python add-on (see its README), with these changes:
   here, against 4.0 s for its Metal GPU run (different machines).
 
 Everything else — Target Shape (Cube, Octahedron, Pyramid, Hex Column,
-Rounded Cube with Roundness), Cubeness, Cube Orientation, Iterations / ADMM
+Rounded Cube with Roundness), Keep Orientation, Cubeness, Cube Orientation,
+Iterations / ADMM
 Iterations, Apply to Copy, Style as Process (Cubeness Ramp / Iterations,
 Steps, Iterations / Step, Frame Step), Cubify Every Frame (to Copy) with
 its Cube Axes option (Object / World), Set /

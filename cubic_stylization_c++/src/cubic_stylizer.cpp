@@ -67,13 +67,14 @@ struct UnionFind {
 CubicStylizer::CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cubeness,
                              const Eigen::Matrix3d& cube_axes,
                              const std::vector<int32_t>& pins, double flat_relax,
-                             int32_t target, double roundness)
+                             int32_t target, double roundness, bool keep_orientation)
     : V0_(V),
       F_(F),
       n_(static_cast<int>(V.rows())),
       lam_(cubeness),
       A_(cube_axes),
       target_(target, roundness),
+      keep_orientation_(keep_orientation),
       flat_relax_(std::clamp(flat_relax, 1e-4, 1.0)) {
   if (n_ == 0 || F_.rows() == 0) throw std::invalid_argument("mesh has no vertices or faces");
   if (F_.minCoeff() < 0 || F_.maxCoeff() >= n_)
@@ -417,6 +418,29 @@ void CubicStylizer::restore_base_weights() {
   factorize(false);
 }
 
+// ARAP is unchanged by a rotation of the whole mesh, so without pins the
+// stylization term alone decides the mesh's orientation and may turn it as a
+// whole (Suzanne's head turns 10-14 degrees under the cube or octahedron).
+// Undoing the area-weighted best-fit rotation from the rest pose
+// costs no ARAP energy and makes the target shape come from reshaping.
+void CubicStylizer::remove_net_rotation(RowMatX3d& V) const {
+  double total = 0.0;
+  Eigen::Vector3d c0 = Eigen::Vector3d::Zero(), c = Eigen::Vector3d::Zero();
+  for (int i = 0; i < n_; ++i) {
+    total += area_[i];
+    c0 += area_[i] * row3(V0_, i);
+    c += area_[i] * row3(V, i);
+  }
+  if (total <= 0.0) return;
+  c0 /= total;
+  c /= total;
+  Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
+  for (int i = 0; i < n_; ++i)
+    H.noalias() += area_[i] * (row3(V0_, i) - c0) * (row3(V, i) - c).transpose();
+  const Eigen::Matrix3d Rt = fit_rotation(H).transpose();  // fit_rotation(H): rest -> current
+  for (int i = 0; i < n_; ++i) V.row(i) = (Rt * (row3(V, i) - c) + c).transpose();
+}
+
 void CubicStylizer::place_floating_parts(RowMatX3d& V) const {
   for (const Part& part : parts_) {
     Eigen::Vector3d t;
@@ -552,6 +576,7 @@ RowMatX3d CubicStylizer::solve(const RowMatX3d* pin_pos, const RowMatX3d* V_init
       restore_base_weights();
     local_step(V, admm_iters, pool);
     RowMatX3d V_new = global_step(ppos, pool);
+    if (keep_orientation_ && pins_.empty()) remove_net_rotation(V_new);
     place_floating_parts(V_new);
     has_iterated_ = true;
     const double step = (V_new - V).rowwise().norm().maxCoeff();

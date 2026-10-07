@@ -105,11 +105,19 @@ benchmarked on this machine.
 pillow close to a sphere; `0.5` gives clearly rounded edges.
 
 All targets keep the rest of the tool intact: pins, Style as Process,
-Cubify Every Frame and Stylized Drag use the selected target. Because the
-energy leaves an object's overall rotation free, a mesh whose large flat
-areas sit between two preferred directions may turn as a whole (for
-example a head under Octahedron tips ~45° to put its face on a diagonal);
-counter-rotate with Cube Orientation or pin a few vertices to hold it.
+Cubify Every Frame and Stylized Drag use the selected target.
+
+**Keep Orientation** — the energy leaves a mesh's overall rotation free, so
+without pins the target term can turn the whole mesh to line its large flat
+areas up with the target's faces (Suzanne's head nods 10–14° about its
+ear-to-ear axis under Cube, Octahedron or Hex Column, 4–5° under the
+others). With Keep Orientation on, the
+mesh's area-weighted best-fit rotation from the rest pose is undone after
+every global step: that costs no ARAP energy, so the target shape has to
+come from reshaping instead (it forms about as strongly as when the mesh
+may turn). Off by default, so existing results don't change; it has no
+effect with pins, which already hold the orientation. In Cubify Every Frame
+it makes World mode follow the animated heading exactly.
 The GPU backend implements Cube only; other targets run on the CPU solver.
 
 ## Style as Process (animation bake)
@@ -187,6 +195,17 @@ Options:
 
 The pose at the moment you press **Start Manipulation** is used as the ARAP
 rest pose.
+
+## Tests
+
+Run headless from the repository root (both add-ons, Python and C++ solvers):
+
+```sh
+blender --background --python-exit-code 1 --python tests/test_targets.py
+blender --background --python-exit-code 1 --python tests/test_style_bake.py
+```
+
+The C++ add-on has its own suite in `cubic_stylization_c++/tests/`.
 
 ## Notes
 

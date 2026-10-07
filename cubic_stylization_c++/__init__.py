@@ -153,7 +153,8 @@ def create_stylizer(context, V, F, cubeness, A, pins, allow_square_flat=True):
                                   threads=props.threads,
                                   server_path=server_path(context),
                                   flat_relax=flat_relax(props) if allow_square_flat else 1.0,
-                                  target=props.target_shape, roundness=props.roundness)
+                                  target=props.target_shape, roundness=props.roundness,
+                                  keep_orientation=props.keep_orientation)
 
 
 def cube_axes(props):
@@ -188,6 +189,13 @@ class CubifyCppSettings(bpy.types.PropertyGroup):
             ('ROUNDED_CUBE', "Rounded Cube", "Pulls toward the cube axes without "
              "snapping, rounding edges and corners (see Roundness)"),
         ], default='CUBE')
+    keep_orientation: bpy.props.BoolProperty(
+        name="Keep Orientation",
+        description="Stop the whole mesh from turning to line its large flat "
+                    "areas up with the target's faces (e.g. a head turning "
+                    "10-14 degrees under Cube or Octahedron): the shape is stylized in place. "
+                    "No effect with pins, which already hold the orientation",
+        default=False)
     roundness: bpy.props.FloatProperty(
         name="Roundness",
         description="Rounded Cube only: 0 is nearly a sharp cube, 1 a soft "
@@ -1012,6 +1020,7 @@ class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
         sub.prop(props, "square_flat_strength")
         layout.prop(props, "threads")
         layout.prop(props, "orientation")
+        layout.prop(props, "keep_orientation")
         layout.prop(props, "apply_to_copy")
         layout.operator(OBJECT_OT_cubify_cpp.bl_idname, icon='MESH_CUBE')
         row = layout.row(align=True)
