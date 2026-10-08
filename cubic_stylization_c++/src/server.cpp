@@ -159,6 +159,9 @@ class Server {
       case protocol::kFixThinWalls:
         fix_walls(in);
         return true;
+      case protocol::kSetStyle:
+        set_style(in);
+        return true;
       case protocol::kShutdown:
         Writer().send();
         return false;
@@ -168,6 +171,27 @@ class Server {
   }
 
  private:
+  static std::vector<Eigen::Vector3d> read_dirs(Reader& in) {
+    const int32_t nd = in.get<int32_t>();
+    if (nd < 0 || nd > 4 * kMaxCustomDirections) throw std::invalid_argument("bad direction count");
+    std::vector<Eigen::Vector3d> dirs(nd);
+    for (auto& d : dirs) in.take(d.data(), sizeof(double) * 3);
+    return dirs;
+  }
+
+  void set_style(Reader& in) {
+    Session& s = session(in.get<uint32_t>());
+    const int32_t target = in.get<int32_t>();
+    const int32_t keep_orientation = in.get<int32_t>();
+    const double roundness = in.get<double>();
+    const double flat_relax = in.get<double>();
+    Eigen::Matrix<double, 3, 3, Eigen::RowMajor> A;
+    in.take(A.data(), sizeof(double) * 9);
+    s.stylizer->set_style(target, roundness, read_dirs(in), keep_orientation != 0, flat_relax,
+                          Eigen::Matrix3d(A));
+    Writer().send();
+  }
+
   void create(Reader& in) {
     const int32_t n = in.get<int32_t>();
     const int32_t m = in.get<int32_t>();
@@ -187,10 +211,11 @@ class Server {
     in.take(F.data(), sizeof(int32_t) * 3 * static_cast<size_t>(m));
     std::vector<int32_t> pins(k);
     in.take(pins.data(), sizeof(int32_t) * static_cast<size_t>(k));
+    const std::vector<Eigen::Vector3d> dirs = read_dirs(in);
 
     auto s = std::make_unique<Session>();
     s->stylizer = std::make_unique<CubicStylizer>(V, F, lam, Eigen::Matrix3d(A), pins, flat_relax,
-                                                  target, roundness, keep_orientation != 0);
+                                                  target, roundness, keep_orientation != 0, dirs);
     s->threads = threads;
 
     const uint32_t id = next_id_++;

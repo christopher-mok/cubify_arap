@@ -16,12 +16,14 @@
 //   HELLO      -> int32 protocol_version, int32 hardware_threads, utf8 version
 //   CREATE     int32 n, int32 m, int32 k, int32 threads,
 //              int32 target (TargetShape: 0 cube, 1 octahedron, 2 pyramid,
-//              3 hex column, 4 rounded cube), int32 keep_orientation (0/1),
+//              3 hex column, 4 rounded cube, 5 custom),
+//              int32 keep_orientation (0/1),
 //              f64 cubeness,
 //              f64 flat_relax (1 = off, see CubicStylizer),
 //              f64 roundness (rounded cube only, 0..1),
 //              f64 A[9] (row-major cube axes), f64 V[3n], int32 F[3m],
-//              int32 pins[k]
+//              int32 pins[k], int32 nd, f64 dirs[3nd] (custom target's
+//              preferred directions; nd = 0 otherwise)
 //              -> uint32 session, int32 kp, int32 pins[kp] (sorted, unique)
 //   SOLVE      uint32 session, int32 iterations, int32 admm_iters,
 //              uint32 flags, [f64 pin_pos[3kp] if kHasPinPos],
@@ -35,6 +37,12 @@
 //              f64 V_rest[3n], f64 V[3n], int32 F[3m]
 //              -> int32 walls, int32 crossed_before, int32 crossed_after,
 //                 int32 moved, int32 passes, int32 n, f64 max_move, f64 V[3n]
+//   SET_STYLE  uint32 session, int32 target, int32 keep_orientation,
+//              f64 roundness, f64 flat_relax, f64 A[9], int32 nd,
+//              f64 dirs[3nd]                           -> (empty)
+//              restyles without refactorizing and restarts the session's
+//              state, so the next solve from the rest pose matches a
+//              fresh CREATE (target 5 = custom)
 //   SHUTDOWN   (empty)                                 -> (empty), then exit
 
 #pragma once
@@ -44,7 +52,7 @@
 namespace cubify {
 namespace protocol {
 
-constexpr int32_t kVersion = 5;
+constexpr int32_t kVersion = 6;
 
 enum Op : uint32_t {
   kHello = 0,
@@ -55,6 +63,7 @@ enum Op : uint32_t {
   kDestroy = 5,
   kShutdown = 6,
   kFixThinWalls = 7,
+  kSetStyle = 8,
 };
 
 enum Resp : uint32_t {
