@@ -18,15 +18,14 @@ import bpy
 import gpu
 import numpy as np
 from gpu_extras.batch import batch_for_shader
-from mathutils import Euler, Matrix, Vector
+from mathutils import Euler, Vector
 from bpy_extras import view3d_utils
 
 if "client" in locals():
     import importlib
     importlib.reload(client)  # noqa: F821
     importlib.reload(builder)  # noqa: F821
-    importlib.reload(gauss)  # noqa: F821
-from . import builder, client, gauss
+from . import builder, client
 
 # Shared with the Python add-on, so pins carry over between the two.
 PIN_GROUP = "CubifyPins"
@@ -155,29 +154,7 @@ def create_stylizer(context, V, F, cubeness, A, pins, allow_square_flat=True):
                                   server_path=server_path(context),
                                   flat_relax=flat_relax(props) if allow_square_flat else 1.0,
                                   target=props.target_shape, roundness=props.roundness,
-                                  keep_orientation=props.keep_orientation,
-                                  directions=custom_directions(props))
-
-
-def custom_directions(props):
-    """(k, 3) directions of the Custom target (target frame)."""
-    D = np.empty(len(props.custom_dirs) * 3)
-    props.custom_dirs.foreach_get("direction", D)
-    return D.reshape(-1, 3)
-
-
-def target_directions(props):
-    """Preferred directions of the current target (target frame)."""
-    if props.target_shape == 'CUSTOM':
-        return gauss.normalized_unique(custom_directions(props))
-    return gauss.preset_directions(props.target_shape)
-
-
-def set_custom_directions(props, D):
-    props.custom_dirs.clear()
-    for d in np.asarray(D, dtype=np.float64).reshape(-1, 3):
-        props.custom_dirs.add().direction = tuple(d / np.linalg.norm(d))
-    props.custom_dirs_index = 0
+                                  keep_orientation=props.keep_orientation)
 
 
 def cube_axes(props):
@@ -195,14 +172,6 @@ def rotation_part(M):
 
 # ================== Settings
 
-class CubifyCppDirection(bpy.types.PropertyGroup):
-    direction: bpy.props.FloatVectorProperty(
-        name="Direction",
-        description="A direction surfaces should face (target frame: object "
-                    "space rotated by Cube Orientation)",
-        subtype='DIRECTION', size=3, default=(0.0, 0.0, 1.0))
-
-
 class CubifyCppSettings(bpy.types.PropertyGroup):
     target_shape: bpy.props.EnumProperty(
         name="Target Shape",
@@ -219,35 +188,7 @@ class CubifyCppSettings(bpy.types.PropertyGroup):
              "top and bottom: basalt columns, along Z"),
             ('ROUNDED_CUBE', "Rounded Cube", "Pulls toward the cube axes without "
              "snapping, rounding edges and corners (see Roundness)"),
-            ('CUSTOM', "Custom", "Faces snap to your own directions: taken from "
-             "a reference object, picked from selected faces, or edited by hand"),
         ], default='CUBE')
-    custom_dirs: bpy.props.CollectionProperty(type=CubifyCppDirection)
-    custom_dirs_index: bpy.props.IntProperty(name="Active Direction", min=0)
-    reference_object: bpy.props.PointerProperty(
-        name="Reference",
-        description="Mesh whose facets become the Custom target: a low-poly "
-                    "shape gives exactly its face directions, a detailed one "
-                    "its dominant planes. Its rotation relative to the "
-                    "stylized object orients the style (the object itself "
-                    "exaggerates its own planes)",
-        type=bpy.types.Object,
-        poll=lambda self, ob: ob.type == 'MESH')
-    merge_angle: bpy.props.FloatProperty(
-        name="Merge Angle",
-        description="Reference normals closer than this become one facet "
-                    "direction (lower keeps more, finer facets)",
-        default=10.0, min=1.0, max=45.0, subtype='NONE', precision=1)
-    min_facet_area: bpy.props.FloatProperty(
-        name="Min Facet Area",
-        description="Facet directions covering less than this share of the "
-                    "reference's surface are dropped",
-        default=0.5, min=0.0, max=20.0, subtype='PERCENTAGE', precision=1)
-    show_target: bpy.props.BoolProperty(
-        name="Show Target",
-        description="Draw the target shape (the solid the style pulls toward) "
-                    "over the active object, oriented by Cube Orientation",
-        default=True)
     keep_orientation: bpy.props.BoolProperty(
         name="Keep Orientation",
         description="Stop the whole mesh from turning to line its large flat "
@@ -373,8 +314,7 @@ class OBJECT_OT_cubify_cpp(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         ob = context.active_object
-        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH'
-                and not live_preview_running())
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
 
     def execute(self, context):
         props = context.scene.cubify_cpp_settings
@@ -491,8 +431,7 @@ class OBJECT_OT_cubify_cpp_fix_thin_walls(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         ob = context.active_object
-        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH'
-                and not live_preview_running())
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
 
     def execute(self, context):
         targets = [ob for ob in context.selected_objects if ob.type == 'MESH']
@@ -535,8 +474,7 @@ class OBJECT_OT_cubify_cpp_bake_anim(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         ob = context.active_object
-        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH'
-                and not live_preview_running())
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
 
     def execute(self, context):
         props = context.scene.cubify_cpp_settings
@@ -685,8 +623,7 @@ class OBJECT_OT_cubify_cpp_bake_frames(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         ob = context.active_object
-        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH'
-                and not live_preview_running())
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
 
     def execute(self, context):
         props = context.scene.cubify_cpp_settings
@@ -869,8 +806,7 @@ class OBJECT_OT_arap_cpp_manipulate(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         ob = context.active_object
-        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH'
-                and not live_preview_running())
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
 
     def invoke(self, context, event):
         ob = context.active_object
@@ -1030,431 +966,6 @@ class OBJECT_OT_arap_cpp_manipulate(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
-# ================== Custom target authoring
-
-def live_preview_running():
-    return OBJECT_OT_cubify_cpp_live_preview.running
-
-
-class CUBIFY_CPP_UL_directions(bpy.types.UIList):
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname,
-                  index=0, flt_flag=0):
-        d = item.direction
-        layout.label(text=f"{index + 1}:   {d[0]:+.2f}   {d[1]:+.2f}   {d[2]:+.2f}",
-                     icon='EMPTY_SINGLE_ARROW')
-
-
-class CUBIFY_CPP_OT_dirs_edit(bpy.types.Operator):
-    """Edit the Custom target's directions"""
-    bl_idname = "cubify_cpp.dirs_edit"
-    bl_label = "Edit Directions"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    action: bpy.props.EnumProperty(items=[
-        ('ADD', "Add", "Add a direction (edit it with the ball below the list)"),
-        ('REMOVE', "Remove", "Remove the active direction"),
-        ('CLEAR', "Clear", "Remove all directions"),
-        ('CLOSE', "Close Shape", "Add the fewest directions needed so the target "
-         "is a closed shape (something faces every side)"),
-    ], default='ADD')
-
-    def execute(self, context):
-        props = context.scene.cubify_cpp_settings
-        dirs = props.custom_dirs
-        if self.action == 'ADD':
-            dirs.add().direction = (0.0, 0.0, 1.0)
-            props.custom_dirs_index = len(dirs) - 1
-        elif self.action == 'REMOVE':
-            if 0 <= props.custom_dirs_index < len(dirs):
-                dirs.remove(props.custom_dirs_index)
-                props.custom_dirs_index = max(0, min(props.custom_dirs_index, len(dirs) - 1))
-        elif self.action == 'CLEAR':
-            dirs.clear()
-            props.custom_dirs_index = 0
-        else:
-            D, added = gauss.close_directions(custom_directions(props))
-            set_custom_directions(props, D)
-            self.report({'INFO'}, f"added {added} direction{'s' if added != 1 else ''}"
-                        if added else "already closed")
-        return {'FINISHED'}
-
-
-class CUBIFY_CPP_OT_dirs_preset(bpy.types.Operator):
-    """Start the Custom target from a preset's directions, to edit from there"""
-    bl_idname = "cubify_cpp.dirs_preset"
-    bl_label = "Start from Preset"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    preset: bpy.props.EnumProperty(items=[
-        ('CUBE', "Cube", ""), ('OCTAHEDRON', "Octahedron", ""),
-        ('PYRAMID', "Pyramid", ""), ('HEX_COLUMN', "Hex Column", ""),
-    ])
-
-    def execute(self, context):
-        props = context.scene.cubify_cpp_settings
-        set_custom_directions(props, gauss.preset_directions(self.preset))
-        props.target_shape = 'CUSTOM'
-        return {'FINISHED'}
-
-
-class CUBIFY_CPP_OT_dirs_from_object(bpy.types.Operator):
-    """Set the Custom target's directions from the Reference object's facets:
-    a low-poly shape gives exactly its face directions, a detailed one its
-    dominant planes. Oriented by the Reference's rotation relative to the
-    active object"""
-    bl_idname = "cubify_cpp.dirs_from_object"
-    bl_label = "Directions from Reference"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return context.scene.cubify_cpp_settings.reference_object is not None
-
-    def execute(self, context):
-        props = context.scene.cubify_cpp_settings
-        ref = props.reference_object
-        ref_eval = ref.evaluated_get(context.evaluated_depsgraph_get())
-        me = ref_eval.to_mesh()
-        try:
-            V, F = read_mesh_arrays(me)
-        finally:
-            ref_eval.to_mesh_clear()
-        if len(F) == 0:
-            self.report({'ERROR'}, f"{ref.name} has no faces")
-            return {'CANCELLED'}
-        N, A = gauss.face_normals(V, F)
-        D, _ = gauss.cluster_normals(N, A, props.merge_angle, props.min_facet_area / 100.0,
-                                     max_dirs=gauss.MAX_REFERENCE_DIRECTIONS)
-        if len(D) == 0:
-            self.report({'ERROR'}, "no facet is large enough: lower Min Facet Area")
-            return {'CANCELLED'}
-        ob = context.active_object if context.active_object is not None else ref
-        R_rel = rotation_part(ob.matrix_world).T @ rotation_part(ref.matrix_world)
-        D = (D @ R_rel.T) @ cube_axes(props)  # reference -> object -> target frame
-        D, added = gauss.close_directions(D)
-        set_custom_directions(props, D)
-        props.target_shape = 'CUSTOM'
-        note = f" (+{added} to close the shape)" if added else ""
-        self.report({'INFO'}, f"{len(D) - added} facet directions from {ref.name}{note}")
-        return {'FINISHED'}
-
-
-class CUBIFY_CPP_OT_dirs_add_selection(bpy.types.Operator):
-    """Add the selected faces' average direction to the Custom target, so
-    that region becomes one flat facet facing the way it already roughly
-    faces (Edit Mode)"""
-    bl_idname = "cubify_cpp.dirs_add_selection"
-    bl_label = "Add Facet from Selection"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        ob = context.active_object
-        return context.mode == 'EDIT_MESH' and ob is not None and ob.type == 'MESH'
-
-    def execute(self, context):
-        props = context.scene.cubify_cpp_settings
-        ob = context.active_object
-        ob.update_from_editmode()
-        polys = ob.data.polygons
-        n = len(polys)
-        sel = np.zeros(n, dtype=bool)
-        polys.foreach_get("select", sel)
-        nrm = np.empty(n * 3)
-        polys.foreach_get("normal", nrm)
-        area = np.empty(n)
-        polys.foreach_get("area", area)
-        m = (nrm.reshape(-1, 3)[sel] * area[sel, None]).sum(axis=0)
-        if not sel.any() or np.linalg.norm(m) < 1e-12:
-            self.report({'ERROR'}, "select some faces first (Face select mode)")
-            return {'CANCELLED'}
-        d = (m / np.linalg.norm(m)) @ cube_axes(props)  # object -> target frame
-        props.custom_dirs.add().direction = tuple(d)
-        props.custom_dirs_index = len(props.custom_dirs) - 1
-        props.target_shape = 'CUSTOM'
-        self.report({'INFO'}, f"added facet direction ({d[0]:+.2f}, {d[1]:+.2f}, {d[2]:+.2f}) "
-                              f"from {int(sel.sum())} faces")
-        return {'FINISHED'}
-
-
-class CUBIFY_CPP_OT_auto_orient(bpy.types.Operator):
-    """Set Cube Orientation to the rotation under which the active mesh
-    already fits the target best, so stylizing reshapes it least and does
-    not turn it. Among equally good fits it keeps the one closest to the
-    current axes"""
-    bl_idname = "cubify_cpp.auto_orient"
-    bl_label = "Auto Orient"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        ob = context.active_object
-        return context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH'
-
-    def execute(self, context):
-        props = context.scene.cubify_cpp_settings
-        ob = context.active_object
-        V, F = read_mesh_arrays(ob.data)
-        N, A = gauss.face_normals(V, F)
-        if len(N) == 0:
-            self.report({'ERROR'}, f"{ob.name} has no faces")
-            return {'CANCELLED'}
-        custom = props.target_shape == 'CUSTOM'
-        D = target_directions(props) if custom else None
-        if custom and (len(D) < 4 or gauss.open_direction(D) is not None):
-            self.report({'ERROR'}, "the custom directions are not a closed shape (Close Shape)")
-            return {'CANCELLED'}
-        # search relative to the current orientation, so ties keep it
-        A0 = cube_axes(props)
-        R = gauss.auto_orientation(N @ A0, A, props.target_shape, D,
-                                   gauss.rounded_exponent(props.roundness))
-        props.orientation = Matrix((A0 @ R).tolist()).to_euler('XYZ')
-        angle = np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1)))
-        self.report({'INFO'}, f"{ob.name}: target turned {angle:.1f} deg to fit")
-        return {'FINISHED'}
-
-
-# ---- target drawing
-
-_TARGET_DRAW = {"handle": None, "shader": None, "key": None, "geom": None}
-
-
-def _target_geometry(props):
-    """(vertices, edges) of the target polytope, cached; None if open."""
-    D = target_directions(props)
-    key = (props.target_shape, D.round(9).tobytes())
-    if _TARGET_DRAW["key"] != key:
-        geom = None
-        if len(D) >= 4 and gauss.open_direction(D) is None:
-            geom = gauss.polytope(D)
-        _TARGET_DRAW["key"], _TARGET_DRAW["geom"] = key, geom
-    return _TARGET_DRAW["geom"]
-
-
-def _draw_target():
-    context = bpy.context
-    props = getattr(context.scene, "cubify_cpp_settings", None)
-    ob = context.active_object
-    if props is None or not props.show_target or ob is None or ob.type != 'MESH':
-        return
-    geom = _target_geometry(props)
-    if geom is None or len(geom[1]) == 0:
-        return
-    verts, edges = geom
-    bb = np.array([v[:] for v in ob.bound_box])
-    centre = bb.mean(axis=0)
-    radius = 0.5 * np.linalg.norm(bb.max(axis=0) - bb.min(axis=0))
-    scale = radius / max(np.linalg.norm(verts, axis=1).max(), 1e-9)
-    local = centre + scale * verts @ cube_axes(props).T
-    M = np.array(ob.matrix_world)
-    world = local @ M[:3, :3].T + M[:3, 3]
-    if _TARGET_DRAW["shader"] is None:
-        try:
-            _TARGET_DRAW["shader"] = gpu.shader.from_builtin('UNIFORM_COLOR')
-        except Exception:
-            _TARGET_DRAW["shader"] = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
-    shader = _TARGET_DRAW["shader"]
-    gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('NONE')
-    gpu.state.line_width_set(2.0)
-    shader.bind()
-    shader.uniform_float("color", (1.0, 0.55, 0.1, 0.85))
-    batch_for_shader(shader, 'LINES', {"pos": world[edges.ravel()].tolist()}).draw(shader)
-    gpu.state.line_width_set(1.0)
-    gpu.state.depth_test_set('LESS_EQUAL')
-    gpu.state.blend_set('NONE')
-
-
-# ================== Live preview
-
-class OBJECT_OT_cubify_cpp_live_preview(bpy.types.Operator):
-    """Live preview: the active mesh re-cubifies whenever you change the
-    target, its directions, Cube Orientation, Cubeness or the other solver
-    settings in the panel. Each change restarts from the original shape, so
-    the result never depends on the editing history: Enter applies exactly
-    what Cubify Mesh would give, Esc restores the mesh"""
-    bl_idname = "object.cubify_cpp_live_preview"
-    bl_label = "Live Preview"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    running = False
-    _TICK = 1.0 / 30.0
-    _BUDGET = 0.025  # seconds of solving per tick, so the UI stays responsive
-
-    @classmethod
-    def poll(cls, context):
-        ob = context.active_object
-        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH'
-                and not cls.running)
-
-    def invoke(self, context, event):
-        ob = context.active_object
-        me = ob.data
-        if me.shape_keys is not None:
-            self.report({'ERROR'}, "Meshes with shape keys are not supported")
-            return {'CANCELLED'}
-        if len(me.polygons) == 0:
-            self.report({'ERROR'}, f"{ob.name} has no faces")
-            return {'CANCELLED'}
-        props = context.scene.cubify_cpp_settings
-        V, F = read_mesh_arrays(me)
-        try:
-            self.stylizer, self.device, _ = create_stylizer(
-                context, V, F, props.cubeness, cube_axes(props), get_pin_indices(ob))
-        except Exception as exc:
-            self.report({'ERROR'}, f"solver setup failed ({exc})")
-            return {'CANCELLED'}
-        self.ob = ob
-        self.V_orig = V
-        self.V_cur = V.copy()
-        self.F = F
-        self.sig = self._signature(props)
-        self.done = 0
-        self.t_iter = None
-        self.error = None
-        wm = context.window_manager
-        self.timer = wm.event_timer_add(self._TICK, window=context.window)
-        wm.modal_handler_add(self)
-        type(self).running = True
-        self._status(context, props)
-        return {'RUNNING_MODAL'}
-
-    @staticmethod
-    def _signature(props):
-        dirs = custom_directions(props).round(6).tobytes() if props.target_shape == 'CUSTOM' else b""
-        return (props.target_shape, round(props.roundness, 6), props.keep_orientation,
-                round(flat_relax(props), 6), tuple(round(a, 6) for a in props.orientation),
-                dirs, round(props.cubeness, 6), props.iterations, props.admm_iterations,
-                props.threads)
-
-    def _restyle(self, props):
-        s = self.stylizer
-        s.set_style(target=props.target_shape, roundness=props.roundness,
-                    keep_orientation=props.keep_orientation, flat_relax=flat_relax(props),
-                    cube_axes=cube_axes(props), directions=custom_directions(props))
-        if s.lam != props.cubeness:
-            s.lam = props.cubeness
-        s.set_threads(props.threads)
-        self.done = 0
-
-    def _step(self, props, budget):
-        """Solve for up to `budget` seconds, continuing the current run."""
-        total = props.iterations
-        while self.done < total:
-            n = total - self.done
-            if self.t_iter is not None:
-                n = max(1, min(n, int(budget / max(self.t_iter, 1e-5))))
-            else:
-                n = 1
-            t0 = time.perf_counter()
-            self.V_cur = self.stylizer.solve(iterations=n, admm_iters=props.admm_iterations,
-                                             warm_last=self.done > 0)
-            dt = time.perf_counter() - t0
-            self.t_iter = dt / n
-            # stopping early means converged, exactly where one long solve stops
-            self.done = total if self.stylizer.last_iterations < n else self.done + n
-            budget -= dt
-            if budget <= 0.0:
-                break
-        write_mesh_positions(self.ob.data, self.V_cur)
-
-    def _status(self, context, props):
-        if self.error:
-            text = f"Live Preview: {self.error}"
-        else:
-            state = ("done" if self.done >= props.iterations
-                     else f"iteration {self.done}/{props.iterations}")
-            text = f"Live Preview ({self.device}, {state})"
-        context.workspace.status_text_set(text + "  |  Enter: apply  |  Esc: cancel")
-
-    def _finish(self, context):
-        context.window_manager.event_timer_remove(self.timer)
-        context.workspace.status_text_set(None)
-        self.stylizer.close()
-        type(self).running = False
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
-
-    def modal(self, context, event):
-        try:
-            me = self.ob.data
-        except ReferenceError:  # object deleted (or undo) under the preview
-            self._finish(context)
-            return {'CANCELLED'}
-        if context.mode != 'OBJECT':
-            write_mesh_positions(me, self.V_orig)
-            self._finish(context)
-            self.report({'WARNING'}, "Live Preview cancelled (left Object Mode)")
-            return {'CANCELLED'}
-        props = context.scene.cubify_cpp_settings
-
-        if event.type == 'TIMER':
-            sig = self._signature(props)
-            if sig != self.sig:
-                self.sig = sig
-                try:
-                    self._restyle(props)
-                    self.error = None
-                except Exception as exc:  # e.g. an open custom direction set
-                    self.error = str(exc)
-            if self.error is None and self.done < props.iterations:
-                try:
-                    self._step(props, self._BUDGET)
-                except Exception as exc:
-                    self.error = str(exc)
-                for area in context.screen.areas:
-                    if area.type == 'VIEW_3D':
-                        area.tag_redraw()
-            self._status(context, props)
-            return {'PASS_THROUGH'}
-
-        # undo would swap the mesh out from under the preview
-        if event.type == 'Z' and (event.ctrl or event.oskey):
-            return {'RUNNING_MODAL'}
-
-        if event.type in {'RET', 'NUMPAD_ENTER'} and event.value == 'PRESS':
-            return self._apply(context, props)
-
-        if event.type == 'ESC' and event.value == 'PRESS':
-            write_mesh_positions(me, self.V_orig)
-            self._finish(context)
-            return {'CANCELLED'}
-
-        return {'PASS_THROUGH'}
-
-    def _apply(self, context, props):
-        me = self.ob.data
-        if self.error is not None:
-            write_mesh_positions(me, self.V_orig)
-            self._finish(context)
-            self.report({'ERROR'}, f"nothing applied: {self.error}")
-            return {'CANCELLED'}
-        try:
-            self._step(props, float("inf"))  # finish the run: same as Cubify Mesh
-            V_out, note = self.V_cur, ""
-            if props.auto_fix_walls:
-                V_out, st = fix_walls(context, self.V_orig, V_out, self.F)
-                note = "; " + walls_note(st)
-        except Exception as exc:
-            write_mesh_positions(me, self.V_orig)
-            self._finish(context)
-            self.report({'ERROR'}, f"solver failed ({exc})")
-            return {'CANCELLED'}
-        target = self.ob
-        if props.apply_to_copy:
-            write_mesh_positions(me, self.V_orig)
-            target = self.ob.copy()
-            target.data = me.copy()
-            target.name = self.ob.name + "_cubified"
-            context.collection.objects.link(target)
-        store_rest(target.data, self.V_orig)  # for a later Fix Thin Walls
-        write_mesh_positions(target.data, V_out)
-        self._finish(context)
-        self.report({'INFO'}, f"{target.name}: applied the live preview{note}")
-        return {'FINISHED'}
-
-
 # ================== Panel
 
 class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
@@ -1494,18 +1005,9 @@ class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
             else:
                 box.label(text=f"Pins: {n_pins}", icon='PINNED')
 
-        if live_preview_running():
-            box = layout.box()
-            box.label(text="Live Preview: edit settings below", icon='PLAY')
-            box.label(text="Enter applies, Esc cancels")
-        row = layout.row(align=True)
-        row.prop(props, "target_shape")
-        row.prop(props, "show_target", text="",
-                 icon='HIDE_OFF' if props.show_target else 'HIDE_ON')
+        layout.prop(props, "target_shape")
         if props.target_shape == 'ROUNDED_CUBE':
             layout.prop(props, "roundness", slider=True)
-        if props.target_shape == 'CUSTOM':
-            self._draw_custom(context, layout, props)
         col = layout.column(align=True)
         col.prop(props, "cubeness")
         col.prop(props, "iterations")
@@ -1518,12 +1020,9 @@ class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
         sub.prop(props, "square_flat_strength")
         layout.prop(props, "threads")
         layout.prop(props, "orientation")
-        layout.operator(CUBIFY_CPP_OT_auto_orient.bl_idname, icon='ORIENTATION_GIMBAL')
         layout.prop(props, "keep_orientation")
         layout.prop(props, "apply_to_copy")
-        row = layout.row(align=True)
-        row.operator(OBJECT_OT_cubify_cpp.bl_idname, icon='MESH_CUBE')
-        row.operator(OBJECT_OT_cubify_cpp_live_preview.bl_idname, icon='PLAY')
+        layout.operator(OBJECT_OT_cubify_cpp.bl_idname, icon='MESH_CUBE')
         row = layout.row(align=True)
         row.prop(props, "auto_fix_walls")
         row.operator(OBJECT_OT_cubify_cpp_fix_thin_walls.bl_idname, text="Fix Now",
@@ -1556,37 +1055,6 @@ class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
         box.prop(props, "stylized_drag")
         box.prop(props, "drag_iterations")
         box.operator(OBJECT_OT_arap_cpp_manipulate.bl_idname, icon='ORIENTATION_GIMBAL')
-
-    @staticmethod
-    def _draw_custom(context, layout, props):
-        box = layout.box()
-        row = box.row()
-        row.template_list("CUBIFY_CPP_UL_directions", "", props, "custom_dirs",
-                          props, "custom_dirs_index", rows=4)
-        col = row.column(align=True)
-        col.operator(CUBIFY_CPP_OT_dirs_edit.bl_idname, icon='ADD', text="").action = 'ADD'
-        col.operator(CUBIFY_CPP_OT_dirs_edit.bl_idname, icon='REMOVE', text="").action = 'REMOVE'
-        col.separator()
-        col.operator(CUBIFY_CPP_OT_dirs_edit.bl_idname, icon='X', text="").action = 'CLEAR'
-        i = props.custom_dirs_index
-        if 0 <= i < len(props.custom_dirs):
-            box.prop(props.custom_dirs[i], "direction", text="")
-        D = target_directions(props)
-        if len(D) < 4 or gauss.open_direction(D) is not None:
-            box.label(text="Open shape: some side faces nowhere", icon='ERROR')
-            box.operator(CUBIFY_CPP_OT_dirs_edit.bl_idname, text="Close Shape",
-                         icon='MESH_ICOSPHERE').action = 'CLOSE'
-        else:
-            box.label(text=f"{len(D)} directions, closed shape", icon='CHECKMARK')
-        box.separator()
-        box.prop(props, "reference_object")
-        row = box.row(align=True)
-        row.prop(props, "merge_angle")
-        row.prop(props, "min_facet_area")
-        box.operator(CUBIFY_CPP_OT_dirs_from_object.bl_idname, icon='IMPORT')
-        box.operator(CUBIFY_CPP_OT_dirs_add_selection.bl_idname, icon='FACESEL')
-        box.operator_menu_enum(CUBIFY_CPP_OT_dirs_preset.bl_idname, "preset",
-                               text="Start from Preset", icon='PRESET')
 
 
 # ================== Preferences: server status and one-click build
@@ -1717,11 +1185,7 @@ class CubifyCppPreferences(bpy.types.AddonPreferences):
 
 # ================== Registration
 
-_classes = (CubifyCppDirection, CubifyCppSettings, OBJECT_OT_cubify_cpp,
-            OBJECT_OT_cubify_cpp_fix_thin_walls,
-            CUBIFY_CPP_UL_directions, CUBIFY_CPP_OT_dirs_edit, CUBIFY_CPP_OT_dirs_preset,
-            CUBIFY_CPP_OT_dirs_from_object, CUBIFY_CPP_OT_dirs_add_selection,
-            CUBIFY_CPP_OT_auto_orient, OBJECT_OT_cubify_cpp_live_preview,
+_classes = (CubifyCppSettings, OBJECT_OT_cubify_cpp, OBJECT_OT_cubify_cpp_fix_thin_walls,
             OBJECT_OT_cubify_cpp_bake_anim,
             OBJECT_OT_cubify_cpp_bake_frames, OBJECT_OT_cubify_cpp_pins,
             OBJECT_OT_arap_cpp_manipulate, VIEW3D_PT_cubify_cpp,
@@ -1733,14 +1197,9 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.cubify_cpp_settings = bpy.props.PointerProperty(type=CubifyCppSettings)
-    _TARGET_DRAW["handle"] = bpy.types.SpaceView3D.draw_handler_add(
-        _draw_target, (), 'WINDOW', 'POST_VIEW')
 
 
 def unregister():
-    if _TARGET_DRAW["handle"] is not None:
-        bpy.types.SpaceView3D.draw_handler_remove(_TARGET_DRAW["handle"], 'WINDOW')
-        _TARGET_DRAW["handle"] = None
     client.shutdown_server()
     del bpy.types.Scene.cubify_cpp_settings
     for cls in reversed(_classes):

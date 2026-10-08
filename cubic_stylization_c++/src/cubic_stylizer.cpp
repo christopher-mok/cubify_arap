@@ -67,14 +67,13 @@ struct UnionFind {
 CubicStylizer::CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cubeness,
                              const Eigen::Matrix3d& cube_axes,
                              const std::vector<int32_t>& pins, double flat_relax,
-                             int32_t target, double roundness, bool keep_orientation,
-                             const std::vector<Eigen::Vector3d>& custom_dirs)
+                             int32_t target, double roundness, bool keep_orientation)
     : V0_(V),
       F_(F),
       n_(static_cast<int>(V.rows())),
       lam_(cubeness),
       A_(cube_axes),
-      target_(target, roundness, custom_dirs),
+      target_(target, roundness),
       keep_orientation_(keep_orientation),
       flat_relax_(std::clamp(flat_relax, 1e-4, 1.0)) {
   if (n_ == 0 || F_.rows() == 0) throw std::invalid_argument("mesh has no vertices or faces");
@@ -93,28 +92,12 @@ CubicStylizer::CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cube
   build_normals_and_areas();
   build_solver();
 
-  reset_state();
-}
-
-void CubicStylizer::reset_state() {
   // z = A^T n corresponds to the feasible start R = I.
   R_.assign(n_, Eigen::Matrix3d::Identity());
   z_.resize(n_);
   for (int i = 0; i < n_; ++i) z_[i] = A_.transpose() * nhat_[i];
   u_.assign(n_, Eigen::Vector3d::Zero());
   rho_.assign(n_, kRhoInit);
-  has_iterated_ = false;
-}
-
-void CubicStylizer::set_style(int32_t target, double roundness,
-                              const std::vector<Eigen::Vector3d>& custom_dirs, bool keep_orientation,
-                              double flat_relax, const Eigen::Matrix3d& cube_axes) {
-  target_ = Target(target, roundness, custom_dirs);  // validates before anything changes
-  keep_orientation_ = keep_orientation;
-  flat_relax_ = std::clamp(flat_relax, 1e-4, 1.0);
-  A_ = cube_axes;
-  restore_base_weights();
-  reset_state();
 }
 
 // ---------------- precomputation ----------------

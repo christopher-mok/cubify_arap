@@ -60,18 +60,10 @@ class CubicStylizer {
   // rounded cube only.
   // keep_orientation: without pins, undo the mesh's net rotation after
   // every global step (see remove_net_rotation).
-  // custom_dirs: preferred directions for TargetShape::kCustom.
   CubicStylizer(const RowMatX3d& V, const RowMatX3i& F, double cubeness,
                 const Eigen::Matrix3d& cube_axes, const std::vector<int32_t>& pins,
                 double flat_relax = 1.0, int32_t target = 0, double roundness = 0.5,
-                bool keep_orientation = false,
-                const std::vector<Eigen::Vector3d>& custom_dirs = {});
-
-  // Change the style of an existing session without refactorizing, and
-  // restart its state so the next solve from the rest pose equals a fresh
-  // session's (used by the live preview).
-  void set_style(int32_t target, double roundness, const std::vector<Eigen::Vector3d>& custom_dirs,
-                 bool keep_orientation, double flat_relax, const Eigen::Matrix3d& cube_axes);
+                bool keep_orientation = false);
 
   // Local-global iterations; returns the (n, 3) positions.
   //   pin_pos: (pins().size(), 3) targets for the pinned vertices, or null to
@@ -97,7 +89,6 @@ class CubicStylizer {
   void place_floating_parts(RowMatX3d& V) const;
   void remove_net_rotation(RowMatX3d& V) const;
   void local_step(const RowMatX3d& V, int admm_iters, ThreadPool& pool);
-  void reset_state();
   RowMatX3d global_step(const RowMatX3d& ppos, ThreadPool& pool);
 
   RowMatX3d V0_;

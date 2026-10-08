@@ -76,8 +76,6 @@ Identical to the Python add-on (see its README), with these changes:
   0.40, more than Cubeness 0.6 at 0.38). Pins stay put across passes, Fix
   Thin Walls measures against the shape before the first pass, and time
   scales with the count. It applies to Cubify Mesh, not the bakes.
-- **Custom** target, **Show Target**, **Auto Orient** and **Live Preview**
-  (C++ add-on only). See below.
 - **Threads** replaces **Device**: CPU threads for the solver, 0 = all
   cores. There is no GPU backend and no PyTorch install. For reference,
   the Python README's 163,842-vertex benchmark (10 iterations) takes 2.3 s
@@ -91,70 +89,6 @@ Steps, Iterations / Step, Frame Step), Cubify Every Frame (to Copy) with
 its Cube Axes option (Object / World), Set /
 Add / Clear Pins, Stylized Drag, Drag Iterations, Start Manipulation — works
 the same way.
-
-## Custom targets
-
-Choose **Target Shape → Custom** to stylize toward your own set of
-directions: every direction is one facet orientation surfaces will snap to.
-The set describes a solid (the polytope whose faces point that way), and
-the target term pulls the surface toward exactly those directions. The
-list in the panel holds the directions; the ball under it edits the
-active one. Ways to fill it:
-
-- **Directions from Reference** — pick any mesh as **Reference**. A
-  low-poly shape (a 7-sided prism, a hand-modeled gem) gives exactly its
-  face directions; a detailed one gives its dominant planes, found by
-  area-weighted clustering of its face normals (**Merge Angle**: normals
-  closer than this become one facet; **Min Facet Area**: smaller facets
-  are dropped; at most 32 from one reference). The Reference's rotation
-  relative to the stylized object orients the style. Picking the object
-  itself exaggerates its own planes.
-- **Add Facet from Selection** — in Edit Mode, select a region and add its
-  area-weighted average direction: that region becomes one flat facet
-  facing the way it already roughly faces.
-- **Start from Preset** — copy a preset's directions to edit from.
-- **+ / − / ×** — add, remove, clear by hand.
-
-Directions are stored in the target frame, so **Cube Orientation** still
-rotates the whole set. A set must enclose a closed shape (something has to
-face every side; Minkowski's condition) — the panel says when it does not,
-and **Close Shape** adds the fewest directions that fix it (a pyramid's
-four sides get exactly a flat base). Up to 64 directions.
-
-**Show Target** (the eye next to Target Shape) draws the target solid as an
-orange wireframe over the active object, oriented by Cube Orientation, for
-every target.
-
-## Auto Orient
-
-The button under Cube Orientation sets it to the rotation under which the
-active mesh, as it is, already fits the target best (an area-weighted fit
-of its face normals: global search plus refinement). Stylizing then
-reshapes the mesh least and does not turn it — e.g. a box rotated inside
-its mesh data gets the target lined up with its faces (to ~0.03°), and
-Cubify moves its vertices ~20× less. Among equally good fits it keeps the
-one closest to the current orientation, so a symmetric target never flips.
-It pairs well with Keep Orientation.
-
-Note that this solver, like the paper, uses rotated *vertex* normals: an
-8-vertex box has only diagonal corner normals, so even a perfectly
-oriented one gets reshaped; subdivided flat faces behave as expected.
-
-## Live Preview
-
-Next to Cubify Mesh. While it runs, the active mesh re-cubifies whenever
-any target setting changes in the panel — target, custom directions,
-Roundness, Cube Orientation, Cubeness, iterations, Keep Orientation,
-Square Flat Regions — and the status bar shows progress. **Enter** applies,
-**Esc** restores the mesh. Viewport navigation and the panel keep working;
-undo is held off until the preview ends.
-
-Every change restarts from the original shape on the same server session
-(no refactorization: changing the style never touches the system matrix),
-solving in slices of ~25 ms per frame. So the result never depends on the
-editing history, and Enter applies exactly what Cubify Mesh would give with
-the final settings (bit-identical; Auto-fix Thin Walls and Apply to Copy
-are honored, Repeat is not).
 
 ## Square Flat Regions
 
@@ -215,9 +149,8 @@ until none is left.
 Blender (Python)                          cubify_server (C++)
 __init__.py  operators, UI                server.cpp        request loop, sessions
 client.py    process + protocol  ──pipe──▶ cubic_stylizer.*  solver (Eigen)
-gauss.py     directions, outline,         target_shape.h    target terms, projection
-             clustering, Auto Orient      thin_walls.*      Fix Thin Walls
-builder.py   CMake build                  thread_pool.h     parallel_for
+builder.py   CMake build                  thin_walls.*      Fix Thin Walls
+                                          thread_pool.h     parallel_for
 ```
 
 - One server process per Blender session, started on first use and
@@ -227,9 +160,7 @@ builder.py   CMake build                  thread_pool.h     parallel_for
   Each mesh gets a **session** on the server holding its prefactorized
   system and ADMM state. Start Manipulation factorizes once, and each
   mouse move sends only the pin targets; the server warm-starts from its
-  own copy of the previous result. Live Preview restyles a session in
-  place (`SET_STYLE`), which restarts its state so the next solve equals a
-  fresh session's.
+  own copy of the previous result.
 - Solve progress is streamed back and drives Blender's progress bar.
 
 Solver differences from the numpy version (none change results on
@@ -263,14 +194,8 @@ normal meshes):
 python tests/test_against_python.py      # C++ vs the numpy solver, timings
 python tests/test_parts_and_flat.py      # teapot: lid seating, Square Flat Regions
 python tests/test_thin_walls.py          # teapot: thin-wall fix
-python tests/test_custom_targets.py      # custom targets, SET_STYLE, clustering, Auto Orient
 blender -b --factory-startup --python tests/blender_smoke_test.py
-blender -b --factory-startup --python tests/blender_custom_test.py
 ```
-
-`blender_custom_test.py` covers the authoring tools, Auto Orient, the
-target outline and the live preview's solving path (compared with Cubify
-Mesh); the live preview's modal loop itself needs a window.
 
 The Blender smoke test runs every operator except the modal drag, which
 needs a viewport. It also checks that topology and UVs are preserved and

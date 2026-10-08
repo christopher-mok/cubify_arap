@@ -41,10 +41,7 @@ enum class TargetShape : int32_t {
   kPyramid = 2,
   kHexColumn = 3,
   kRoundedCube = 4,
-  kCustom = 5,  // any closed set of preferred directions
 };
-
-constexpr int kMaxCustomDirections = 64;
 
 // Pyramid side-face normals sit this far above the horizon: the faces slope
 // at ~52 degrees, like the Great Pyramid.
@@ -54,42 +51,11 @@ inline double rounded_exponent(double roundness) {
   return 2.0 - 0.5 * std::pow(10.0, -std::clamp(roundness, 0.0, 1.0));
 }
 
-// A direction y that every d in dirs points away from (d . y <= 0), or false
-// if none exists, i.e. the polytope {d . x <= 1} is closed. Such a y can
-// always be taken along some d_i x d_j or some +-d_i (an extreme ray of the
-// cone {y : D y <= 0}, or its line when all the d are coplanar), so testing
-// those candidates is exact.
-inline bool open_direction(const std::vector<Eigen::Vector3d>& dirs, Eigen::Vector3d* witness) {
-  std::vector<Eigen::Vector3d> cand;
-  for (size_t i = 0; i < dirs.size(); ++i) {
-    cand.push_back(dirs[i]);
-    cand.push_back(-dirs[i]);
-    for (size_t j = i + 1; j < dirs.size(); ++j) {
-      const Eigen::Vector3d c = dirs[i].cross(dirs[j]);
-      if (c.norm() > 1e-9) {
-        cand.push_back(c.normalized());
-        cand.push_back(-c.normalized());
-      }
-    }
-  }
-  for (const auto& y : cand) {
-    double worst = -std::numeric_limits<double>::infinity();
-    for (const auto& d : dirs) worst = std::max(worst, d.dot(y));
-    if (worst <= 1e-9) {
-      if (witness != nullptr) *witness = y;
-      return true;
-    }
-  }
-  return false;
-}
-
 class Target {
  public:
-  // roundness only affects the rounded cube; custom holds the preferred
-  // directions of TargetShape::kCustom (normalized and de-duplicated here).
-  explicit Target(int32_t code = 0, double roundness = 0.5,
-                  const std::vector<Eigen::Vector3d>& custom = {}) {
-    if (code < 0 || code > 5) throw std::invalid_argument("unknown target shape " + std::to_string(code));
+  // roundness only affects the rounded cube.
+  explicit Target(int32_t code = 0, double roundness = 0.5) {
+    if (code < 0 || code > 4) throw std::invalid_argument("unknown target shape " + std::to_string(code));
     shape_ = static_cast<TargetShape>(code);
     p_ = rounded_exponent(roundness);
     const double pi = std::acos(-1.0);
@@ -122,28 +88,6 @@ class Target {
         dirs_.push_back(Eigen::Vector3d(0, 0, 1));
         dirs_.push_back(Eigen::Vector3d(0, 0, -1));
         break;
-      case TargetShape::kCustom: {
-        for (const auto& d : custom) {
-          if (!d.allFinite() || d.norm() < 1e-9) continue;
-          const Eigen::Vector3d u = d.normalized();
-          bool dup = false;
-          for (const auto& e : dirs_) dup = dup || e.dot(u) > 1.0 - 1e-9;
-          if (!dup) dirs_.push_back(u);
-        }
-        if (dirs_.size() > static_cast<size_t>(kMaxCustomDirections))
-          throw std::invalid_argument("too many custom directions (" + std::to_string(dirs_.size()) +
-                                      ", at most " + std::to_string(kMaxCustomDirections) + ")");
-        Eigen::Vector3d y;
-        if (dirs_.size() < 4 || open_direction(dirs_, &y)) {
-          if (dirs_.size() < 4) y = Eigen::Vector3d::Zero();
-          throw std::invalid_argument(
-              "custom directions do not enclose a closed shape" +
-              (dirs_.size() < 4 ? std::string(" (need at least 4)")
-                                : " (nothing faces (" + std::to_string(y[0]) + ", " +
-                                      std::to_string(y[1]) + ", " + std::to_string(y[2]) + "))"));
-        }
-        break;
-      }
     }
     if (shape_ != TargetShape::kCube && shape_ != TargetShape::kRoundedCube) build_edges();
   }
@@ -236,8 +180,6 @@ class Target {
     Eigen::Vector3d best = y;
     double best_d2 = std::numeric_limits<double>::infinity();
     for (const auto& d : dirs_) {
-      // the projection lies inside a face only if y is outside that face
-      if (d.dot(y) <= 1.0) continue;
       const Eigen::Vector3d c = y - (d.dot(y) - 1.0) * d;
       const double lim = 1.0 + 1e-9 * std::max(1.0, c.norm());
       bool inside = true;

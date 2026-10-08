@@ -16,13 +16,13 @@ import threading
 
 import numpy as np
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 5
 
 # TargetShape codes (src/target_shape.h)
-TARGETS = ("CUBE", "OCTAHEDRON", "PYRAMID", "HEX_COLUMN", "ROUNDED_CUBE", "CUSTOM")
+TARGETS = ("CUBE", "OCTAHEDRON", "PYRAMID", "HEX_COLUMN", "ROUNDED_CUBE")
 
 (OP_HELLO, OP_CREATE, OP_SOLVE, OP_SET_LAMBDA, OP_SET_THREADS, OP_DESTROY, OP_SHUTDOWN,
- OP_FIX_THIN_WALLS, OP_SET_STYLE) = range(9)
+ OP_FIX_THIN_WALLS) = range(8)
 RESP_OK, RESP_ERROR, RESP_PROGRESS = range(3)
 
 FLAG_PIN_POS = 1 << 0
@@ -227,13 +227,14 @@ class RemoteStylizer:
     target : one of TARGETS (the shape surfaces are stylized toward)
     roundness : 0..1, rounded cube only (0 is nearly the cube)
     keep_orientation : without pins, stop the mesh turning as a whole
-    directions : (k, 3) preferred directions of the CUSTOM target
     """
 
     def __init__(self, server, V, F, cubeness=0.2, cube_axes=None, pins=None,
                  threads=0, flat_relax=1.0, target="CUBE", roundness=0.5,
-                 keep_orientation=False, directions=None):
-        target = _target_code(target)
+                 keep_orientation=False):
+        target = str(target).upper()
+        if target not in TARGETS:
+            raise ValueError(f"unknown target shape {target!r}")
         V = _f64(V)
         F = np.ascontiguousarray(F, dtype=np.int32).reshape(-1, 3)
         A = np.eye(3) if cube_axes is None else np.asarray(cube_axes, dtype=np.float64)
@@ -245,10 +246,9 @@ class RemoteStylizer:
         payload = server.request(
             OP_CREATE,
             struct.pack("<iiiiiiddd", len(V), len(F), len(pins), int(threads),
-                        target, int(bool(keep_orientation)), self._lam,
+                        TARGETS.index(target), int(bool(keep_orientation)), self._lam,
                         float(flat_relax), float(roundness)),
-            np.ascontiguousarray(A.reshape(3, 3), dtype=np.float64), V, F, pins,
-            *_dirs_parts(target, directions))
+            np.ascontiguousarray(A.reshape(3, 3), dtype=np.float64), V, F, pins)
         self.id, kp = struct.unpack_from("<Ii", payload)
         self.pins = np.frombuffer(payload, dtype=np.int32, count=kp, offset=8).astype(np.int64)
 
@@ -262,19 +262,6 @@ class RemoteStylizer:
     def lam(self, value):
         self._lam = float(value)
         self.server.request(OP_SET_LAMBDA, struct.pack("<Id", self.id, self._lam))
-
-    def set_style(self, target="CUBE", roundness=0.5, keep_orientation=False,
-                  flat_relax=1.0, cube_axes=None, directions=None):
-        """Restyle without refactorizing; the session restarts, so the next
-        solve from the rest pose equals a fresh session's."""
-        code = _target_code(target)
-        A = np.eye(3) if cube_axes is None else np.asarray(cube_axes, dtype=np.float64)
-        self.server.request(
-            OP_SET_STYLE,
-            struct.pack("<Iiidd", self.id, code, int(bool(keep_orientation)),
-                        float(roundness), float(flat_relax)),
-            np.ascontiguousarray(A.reshape(3, 3), dtype=np.float64),
-            *_dirs_parts(code, directions))
 
     def set_threads(self, threads):
         self.server.request(OP_SET_THREADS, struct.pack("<Ii", self.id, int(threads)))
@@ -306,8 +293,7 @@ class RemoteStylizer:
         parts[0] = struct.pack("<IiiI", self.id, int(iterations), int(admm_iters), flags)
 
         payload = self.server.request(OP_SOLVE, *parts, on_progress=on_progress)
-        # fewer than `iterations` means the solve converged and stopped early
-        self.last_iterations, n = struct.unpack_from("<ii", payload)
+        _, n = struct.unpack_from("<ii", payload)
         return np.frombuffer(payload, dtype=np.float64, count=3 * n, offset=8).reshape(n, 3).copy()
 
     def run(self, iterations=30, admm_iters=100, on_progress=None, pin_pos=None):
@@ -335,25 +321,9 @@ class RemoteStylizer:
         self.close()
 
 
-def _target_code(target):
-    target = str(target).upper()
-    if target not in TARGETS:
-        raise ValueError(f"unknown target shape {target!r}")
-    return TARGETS.index(target)
-
-
-def _dirs_parts(code, directions):
-    """Trailing (count, directions) payload of CREATE / SET_STYLE."""
-    if TARGETS[code] != "CUSTOM":
-        return [struct.pack("<i", 0)]
-    D = np.ascontiguousarray(directions if directions is not None else [], dtype=np.float64)
-    D = D.reshape(-1, 3)
-    return [struct.pack("<i", len(D)), D]
-
-
 def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None, threads=0,
                     server_path=None, flat_relax=1.0, target="CUBE", roundness=0.5,
-                    keep_orientation=False, directions=None):
+                    keep_orientation=False):
     """Build a stylizer on the C++ server.
 
     Returns (stylizer, device_label, warning) like the Python add-on's
@@ -363,7 +333,7 @@ def create_stylizer(V, F, cubeness=0.2, cube_axes=None, pins=None, threads=0,
     s = RemoteStylizer(server, V, F, cubeness=cubeness, cube_axes=cube_axes,
                        pins=pins, threads=threads, flat_relax=flat_relax,
                        target=target, roundness=roundness,
-                       keep_orientation=keep_orientation, directions=directions)
+                       keep_orientation=keep_orientation)
     used = threads if threads and threads > 0 else server.hardware_threads
     return s, f"C++ ({used} thread{'s' if used != 1 else ''})", None
 
