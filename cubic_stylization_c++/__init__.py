@@ -981,84 +981,17 @@ class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.cubify_cpp_settings
-        ob = context.active_object
 
-        if not os.path.isfile(server_path(context)):
-            box = layout.box()
-            box.label(text="C++ server not built", icon='ERROR')
-            op = box.operator("preferences.addon_show",
-                              text="Build in Add-on Preferences",
-                              icon='PREFERENCES')
-            op.module = __package__
-
-        if ob is not None and ob.type == 'MESH' and ob.data is not None:
-            me = ob.data
-            kind, tris, quads, ngons = mesh_kind(me)
-            box = layout.box()
-            box.label(text=f"{ob.name}: {len(me.vertices)} verts", icon='MESH_DATA')
-            box.label(text=f"{kind} ({tris} tris, {quads} quads"
-                           + (f", {ngons} n-gons)" if ngons else ")"),
-                      icon='MESH_GRID' if quads and not tris else 'MESH_ICOSPHERE')
-            if quads or ngons:
-                box.label(text="Solved on virtual triangulation;", icon='INFO')
-                box.label(text="topology and UVs are preserved")
-            n_pins = (len(get_pin_indices(ob)) if len(me.vertices) <= 100000
-                      else None)
-            if n_pins is None:
-                box.label(text=f"Pins: group '{PIN_GROUP}'", icon='PINNED')
-            else:
-                box.label(text=f"Pins: {n_pins}", icon='PINNED')
-
-        layout.prop(props, "target_shape")
+        layout.prop(props, "cubeness", slider=True)
         if props.target_shape == 'ROUNDED_CUBE':
             layout.prop(props, "roundness", slider=True)
-        col = layout.column(align=True)
-        col.prop(props, "cubeness")
-        col.prop(props, "iterations")
-        col.prop(props, "admm_iterations")
-        col.prop(props, "repeat")
-        row = layout.row(align=True)
-        row.prop(props, "square_flat")
-        sub = row.row(align=True)
-        sub.active = props.square_flat
-        sub.prop(props, "square_flat_strength")
-        layout.prop(props, "threads")
-        layout.prop(props, "orientation")
-        layout.prop(props, "keep_orientation")
+        layout.prop(props, "target_shape", text="Shape Type")
+        layout.prop(props, "repeat")
+        layout.prop(props, "square_flat")
         layout.prop(props, "apply_to_copy")
         layout.operator(OBJECT_OT_cubify_cpp.bl_idname, icon='MESH_CUBE')
-        row = layout.row(align=True)
-        row.prop(props, "auto_fix_walls")
-        row.operator(OBJECT_OT_cubify_cpp_fix_thin_walls.bl_idname, text="Fix Now",
-                     icon='MOD_SOLIDIFY')
-
-        layout.separator()
-        box = layout.box()
-        box.label(text="Style as Process", icon='SHAPEKEY_DATA')
-        row = box.row(align=True)
-        row.prop(props, "anim_mode", expand=True)
-        col = box.column(align=True)
-        col.prop(props, "anim_samples")
-        if props.anim_mode == 'LAMBDA':
-            col.prop(props, "anim_iters")
-        col.prop(props, "anim_frame_step")
-        box.operator(OBJECT_OT_cubify_cpp_bake_anim.bl_idname, icon='RENDER_ANIMATION')
-        box.prop(props, "anim_axes")
-        box.operator(OBJECT_OT_cubify_cpp_bake_frames.bl_idname, icon='DUPLICATE')
-
-        layout.separator()
-        box = layout.box()
-        box.label(text="ARAP Manipulation", icon='VIEW_PAN')
-        row = box.row(align=True)
-        op = row.operator(OBJECT_OT_cubify_cpp_pins.bl_idname, text="Set Pins")
-        op.action = 'SET'
-        op = row.operator(OBJECT_OT_cubify_cpp_pins.bl_idname, text="Add")
-        op.action = 'ADD'
-        op = row.operator(OBJECT_OT_cubify_cpp_pins.bl_idname, text="Clear")
-        op.action = 'CLEAR'
-        box.prop(props, "stylized_drag")
-        box.prop(props, "drag_iterations")
-        box.operator(OBJECT_OT_arap_cpp_manipulate.bl_idname, icon='ORIENTATION_GIMBAL')
+        layout.operator(OBJECT_OT_cubify_cpp_bake_anim.bl_idname,
+                        text="Bake Animation", icon='RENDER_ANIMATION')
 
 
 # ================== Preferences: server status and one-click build
@@ -1191,10 +1124,10 @@ class CubifyCppPreferences(bpy.types.AddonPreferences):
 
 # ================== Registration
 
-_classes = (CubifyCppSettings, OBJECT_OT_cubify_cpp, OBJECT_OT_cubify_cpp_fix_thin_walls,
-            OBJECT_OT_cubify_cpp_bake_anim,
-            OBJECT_OT_cubify_cpp_bake_frames, OBJECT_OT_cubify_cpp_pins,
-            OBJECT_OT_arap_cpp_manipulate, VIEW3D_PT_cubify_cpp,
+# Distribution exposes only mesh stylization and the animation bake.
+# Server maintenance remains available in add-on preferences.
+_classes = (CubifyCppSettings, OBJECT_OT_cubify_cpp,
+            OBJECT_OT_cubify_cpp_bake_anim, VIEW3D_PT_cubify_cpp,
             CUBIFY_CPP_OT_check_server, CUBIFY_CPP_OT_build_server,
             CubifyCppPreferences)
 
