@@ -1,8 +1,8 @@
 __pycache__/
 .DS_Store
-cubic_stylization_c++/build/
+cubic_stylization/build/
 # local (non-universal) builds; the bundled binaries are the platform-named ones
-cubic_stylization_c++/bin/cubify_server
+cubic_stylization/bin/cubify_server
 
 # reference papers kept locally
 *.pdf

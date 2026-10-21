@@ -1,34 +1,33 @@
 bl_info = {
     "name": "Cubic Stylization",
     "author": "Christopher Mok",
-    "version": (1, 1, 0),
+    "version": (1, 0, 0),
     "blender": (2, 93, 0),
     "location": "3D Viewport > Sidebar (N) > Cubify",
-    "description": "Cubify meshes (Liu & Jacobson 2019) and ARAP handle deformation. "
-                   "Works on triangle and quad meshes; topology and UVs are preserved",
+    "description": "Cubify meshes (Liu & Jacobson 2019) and ARAP handle deformation, "
+                   "solved by a native C++/Eigen server process. Works on triangle "
+                   "and quad meshes; topology and UVs are preserved",
     "category": "Mesh",
 }
 
 import os
-import site
-import subprocess
-import sys
 import threading
 import time
 
 import bpy
-import bmesh  # noqa: F401  (kept for users extending the addon)
 import gpu
 import numpy as np
 from gpu_extras.batch import batch_for_shader
 from mathutils import Euler, Vector
 from bpy_extras import view3d_utils
 
-if "solver" in locals():
+if "client" in locals():
     import importlib
-    importlib.reload(solver)  # noqa: F821
-from . import solver
+    importlib.reload(client)  # noqa: F821
+    importlib.reload(builder)  # noqa: F821
+from . import builder, client
 
+# Shared with the Python add-on, so pins carry over between the two.
 PIN_GROUP = "CubifyPins"
 
 
@@ -68,7 +67,7 @@ def read_mesh_arrays(me):
 
     me.calc_loop_triangles()
     m = len(me.loop_triangles)
-    F = np.empty(m * 3, dtype=np.int64)
+    F = np.empty(m * 3, dtype=np.int32)
     me.loop_triangles.foreach_get("vertices", F)
     return V, F.reshape(-1, 3)
 
@@ -87,6 +86,81 @@ def get_pin_indices(ob):
             if any(g.group == gi for g in v.groups)]
 
 
+# Shape before the last Cubify, kept on the mesh (hidden: leading dot) so
+# Fix Thin Walls can run later — it measures walls in the pre-cubify shape.
+REST_ATTR = ".cubify_rest"
+
+
+def store_rest(me, V):
+    a = me.attributes.get(REST_ATTR)
+    if a is not None and (a.domain != 'POINT' or a.data_type != 'FLOAT_VECTOR'):
+        me.attributes.remove(a)
+        a = None
+    if a is None:
+        me.attributes.new(REST_ATTR, 'FLOAT_VECTOR', 'POINT')
+    me.attributes[REST_ATTR].data.foreach_set(
+        "vector", np.asarray(V, dtype=np.float32).ravel())
+
+
+def read_rest(me):
+    """The stored pre-cubify positions, or None if missing or stale."""
+    a = me.attributes.get(REST_ATTR)
+    if (a is None or a.domain != 'POINT' or a.data_type != 'FLOAT_VECTOR'
+            or len(a.data) != len(me.vertices)):
+        return None
+    V = np.empty(len(me.vertices) * 3, dtype=np.float32)
+    a.data.foreach_get("vector", V)
+    return V.reshape(-1, 3).astype(np.float64)
+
+
+def fix_walls(context, V_rest, V, F, min_thickness=0.1, iterations=60):
+    props = context.scene.cubify_cpp_settings
+    return client.fix_thin_walls(V_rest, V, F, min_thickness=min_thickness,
+                                 iterations=iterations, threads=props.threads,
+                                 server_path=server_path(context))
+
+
+def walls_note(st):
+    if st["crossed_before"] == 0 and st["moved"] == 0:
+        return "no thin-wall crossings"
+    return (f"thin walls: {st['crossed_before']} crossed points -> "
+            f"{st['crossed_after']} ({st['moved']} vertices moved, "
+            f"max {st['max_move']:.3g})")
+
+
+def addon_prefs(context=None):
+    context = context or bpy.context
+    addon = context.preferences.addons.get(__package__)
+    return addon.preferences if addon is not None else None
+
+
+def server_path(context=None):
+    prefs = addon_prefs(context)
+    return client.resolve_server_path(prefs.server_path if prefs else "")
+
+
+def flat_relax(props):
+    """Edge-weight factor for Square Flat Regions (1 = off). Strength 1
+    gives 0.01, the value the feature was tuned with."""
+    if not props.square_flat:
+        return 1.0
+    return 1.0 - 0.99 * props.square_flat_strength
+
+
+def create_stylizer(context, V, F, cubeness, A, pins, allow_square_flat=True):
+    props = context.scene.cubify_cpp_settings
+    return client.create_stylizer(V, F, cubeness=cubeness, cube_axes=A, pins=pins,
+                                  threads=props.threads,
+                                  server_path=server_path(context),
+                                  flat_relax=flat_relax(props) if allow_square_flat else 1.0,
+                                  target=props.target_shape, roundness=props.roundness,
+                                  keep_orientation=props.keep_orientation)
+
+
+def cube_axes(props):
+    return np.array(Euler(props.orientation, 'XYZ').to_matrix(), dtype=np.float64)
+
+
 def rotation_part(M):
     """Nearest proper rotation to the 3x3 part of a 4x4 matrix (drops
     scale and shear)."""
@@ -98,7 +172,7 @@ def rotation_part(M):
 
 # ================== Settings
 
-class CubifySettings(bpy.types.PropertyGroup):
+class CubifyCppSettings(bpy.types.PropertyGroup):
     target_shape: bpy.props.EnumProperty(
         name="Target Shape",
         description="The shape surfaces are stylized toward. Its axes follow "
@@ -140,6 +214,13 @@ class CubifySettings(bpy.types.PropertyGroup):
         name="ADMM Iterations",
         description='Rotation-fitting passes per solver step: higher values improve convergence but take longer',
         default=100, min=1, max=300)
+    repeat: bpy.props.IntProperty(
+        name="Repeat",
+        description="Cubify this many times in a row, each pass starting from "
+                    "the previous result (same as pressing Cubify again). The "
+                    "style compounds: stronger than raising Cubeness on "
+                    "detailed shapes. Cubify Mesh only; time scales with it",
+        default=1, min=1, max=20)
     apply_to_copy: bpy.props.BoolProperty(
         name="Apply to Copy",
         description="Cubify a duplicate and keep the original object unchanged",
@@ -187,27 +268,36 @@ class CubifySettings(bpy.types.PropertyGroup):
              "Cube axes stay fixed in the world: a rotating object "
              "re-crystallizes against the world axes as it turns"),
         ], default='OBJECT')
-    device: bpy.props.EnumProperty(
-        name="Device",
-        description="Where the solver runs. GPU devices need PyTorch installed "
-                    "in Blender's Python (one-click install in the add-on "
-                    "preferences)",
-        items=[
-            ('AUTO', "Auto", "GPU for large meshes when available, else CPU"),
-            ('CPU', "CPU", "numpy solver (always available)"),
-            ('CUDA', "CUDA GPU", "NVIDIA GPU via PyTorch"),
-            ('MPS', "Metal GPU (MPS)", "Apple GPU via PyTorch"),
-        ],
-        default='AUTO')
+    square_flat: bpy.props.BoolProperty(
+        name="Square Flat Regions",
+        description="Let surfaces that already face a cube axis (lids, plates, "
+                    "flat tops) reshape in-plane so their round outlines turn "
+                    "square. Goes beyond the paper's method; about 3x slower. "
+                    "Not used while dragging pins",
+        default=False)
+    square_flat_strength: bpy.props.FloatProperty(
+        name="Strength",
+        description="How freely flat regions may reshape (0 = no effect)",
+        default=1.0, min=0.0, max=1.0, subtype='FACTOR')
+    auto_fix_walls: bpy.props.BoolProperty(
+        name="Auto-fix Thin Walls",
+        description="After Cubify and for every baked step, push apart thin "
+                    "walls (e.g. the inner and outer surface of a spout) that "
+                    "cubification made cross each other",
+        default=False)
+    threads: bpy.props.IntProperty(
+        name="Threads",
+        description="CPU threads the C++ solver uses (0 = all cores)",
+        default=0, min=0, max=256)
 
 
 # ================== Cubify operator
 
-class OBJECT_OT_cubify(bpy.types.Operator):
-    """Apply Cubic Stylization to the selected mesh objects.
+class OBJECT_OT_cubify_cpp(bpy.types.Operator):
+    """Apply Cubic Stylization to the selected mesh objects (C++ solver).
     Quad meshes are solved on a virtual triangulation: topology and UVs
     are preserved. Pinned vertices are held in place"""
-    bl_idname = "object.cubify_mesh"
+    bl_idname = "object.cubify_cpp_mesh"
     bl_label = "Cubify Mesh"
     bl_description = 'Reshape selected meshes toward the target shape while keeping pinned vertices fixed'
     bl_options = {'REGISTER', 'UNDO'}
@@ -218,7 +308,7 @@ class OBJECT_OT_cubify(bpy.types.Operator):
         return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
 
     def execute(self, context):
-        props = context.scene.cubify_settings
+        props = context.scene.cubify_cpp_settings
         targets = [ob for ob in context.selected_objects if ob.type == 'MESH']
         if not targets and context.active_object and context.active_object.type == 'MESH':
             targets = [context.active_object]
@@ -263,49 +353,113 @@ class OBJECT_OT_cubify(bpy.types.Operator):
         V, F = read_mesh_arrays(me)
         pins = get_pin_indices(ob)
 
-        A = np.array(Euler(props.orientation, 'XYZ').to_matrix(), dtype=np.float64)
-
         wm = context.window_manager
         t0 = time.time()
-        try:
-            stylizer, device, warn = solver.create_stylizer(
-                V, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
-                device=props.device, target=props.target_shape,
-                roundness=props.roundness,
-                keep_orientation=props.keep_orientation)
-            if warn:
-                self.report({'WARNING'}, f"{ob.name}: {warn}")
-            V_out = stylizer.run(
-                iterations=props.iterations,
-                admm_iters=props.admm_iterations,
-                on_progress=lambda i, total: wm.progress_update(
-                    int(100 * (base + span * i / total))))
-        except Exception as exc:
-            self.report({'ERROR'}, f"{ob.name}: solver failed ({exc})")
-            return False
+        passes = props.repeat
+        V_out = V
+        for p in range(passes):
+            # each pass cubifies the previous result as its new rest pose —
+            # the same as pressing Cubify again, so the style compounds
+            def progress(i, total, p=p):
+                wm.progress_update(int(100 * (base + span * (p + i / total) / passes)))
+            stylizer = None
+            try:
+                stylizer, device, _ = create_stylizer(context, V_out, F, props.cubeness,
+                                                      cube_axes(props), pins)
+                V_out = stylizer.run(iterations=props.iterations,
+                                     admm_iters=props.admm_iterations,
+                                     on_progress=progress)
+            except Exception as exc:
+                self.report({'ERROR'}, f"{ob.name}: solver failed ({exc})")
+                return False
+            finally:
+                if stylizer is not None:
+                    stylizer.close()
 
-        if not np.all(np.isfinite(V_out)):
-            self.report({'ERROR'}, f"{ob.name}: solver produced invalid positions")
-            return False
+            if not np.all(np.isfinite(V_out)):
+                self.report({'ERROR'}, f"{ob.name}: solver produced invalid positions")
+                return False
 
+        fix_note = ""
+        if props.auto_fix_walls:
+            try:
+                V_out, st = fix_walls(context, V, V_out, F)
+                fix_note = "; " + walls_note(st)
+            except Exception as exc:
+                self.report({'WARNING'}, f"{ob.name}: thin-wall fix failed ({exc})")
+
+        store_rest(me, V)  # for a later Fix Thin Walls
         write_mesh_positions(me, V_out)
 
         note = f", {len(pins)} pinned" if pins else ""
+        if passes > 1:
+            note += f", x{passes} passes"
         self.report({'INFO'},
                     f"{ob.name} ({kind.lower()}): cubified {len(V)} vertices in "
                     f"{time.time() - t0:.2f}s on {device} "
-                    f"(lambda={props.cubeness:.2f}{note})")
+                    f"(lambda={props.cubeness:.2f}{note}){fix_note}")
         return True
+
+
+class OBJECT_OT_cubify_cpp_fix_thin_walls(bpy.types.Operator):
+    """Push apart thin walls that the last Cubify made cross each other
+    (e.g. the inner surface of a hollow spout poking through the outer one).
+    Walls are measured in the shape from before that Cubify, which Cubify
+    stores on the mesh"""
+    bl_idname = "object.cubify_cpp_fix_thin_walls"
+    bl_label = "Fix Thin Walls"
+    bl_description = 'Separate thin or crossed walls using their thickness before the last Cubify'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    min_thickness: bpy.props.FloatProperty(
+        name="Min Thickness",
+        description="Walls thinner than this fraction of their original "
+                    "thickness (or crossed) are pushed back to it",
+        default=0.1, min=0.0, max=1.0, subtype='FACTOR')
+    iterations: bpy.props.IntProperty(
+        name="Iterations", description="Maximum push-apart passes",
+        default=60, min=1, max=500)
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
+
+    def execute(self, context):
+        targets = [ob for ob in context.selected_objects if ob.type == 'MESH']
+        if not targets and context.active_object and context.active_object.type == 'MESH':
+            targets = [context.active_object]
+        done = 0
+        for ob in targets:
+            me = ob.data
+            V_rest = read_rest(me)
+            if V_rest is None:
+                self.report({'WARNING'},
+                            f"{ob.name}: skipped (no pre-cubify shape stored — "
+                            "cubify it with this add-on first)")
+                continue
+            V, F = read_mesh_arrays(me)
+            try:
+                V_out, st = fix_walls(context, V_rest, V, F,
+                                      min_thickness=self.min_thickness,
+                                      iterations=self.iterations)
+            except Exception as exc:
+                self.report({'ERROR'}, f"{ob.name}: thin-wall fix failed ({exc})")
+                continue
+            write_mesh_positions(me, V_out)
+            self.report({'INFO'}, f"{ob.name}: {walls_note(st)}")
+            done += 1
+        return {'FINISHED'} if done else {'CANCELLED'}
 
 
 # ================== Style-as-process animation bake
 
-class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
+class OBJECT_OT_cubify_cpp_bake_anim(bpy.types.Operator):
     """Bake the cubification process as an animation over the timeline:
     one absolute shape key per step, driven by keyframed Evaluation Time.
     The base mesh, topology and UVs are untouched — delete the shape keys
     to get the original back"""
-    bl_idname = "object.cubify_bake_animation"
+    bl_idname = "object.cubify_cpp_bake_animation"
     bl_label = "Bake Animation (Shape Keys)"
     bl_description = 'Animate the stylization process by baking each step into a shape key'
     bl_options = {'REGISTER', 'UNDO'}
@@ -316,7 +470,7 @@ class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
         return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
 
     def execute(self, context):
-        props = context.scene.cubify_settings
+        props = context.scene.cubify_cpp_settings
         if props.cubeness <= 0.0:
             self.report({'ERROR'}, "Cubeness is 0 — nothing to animate")
             return {'CANCELLED'}
@@ -355,19 +509,50 @@ class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
 
         V0, F = read_mesh_arrays(me)
         pins = get_pin_indices(ob)
-        A = np.array(Euler(props.orientation, 'XYZ').to_matrix(), dtype=np.float64)
 
         try:
-            stylizer, device, warn = solver.create_stylizer(
-                V0, F, cubeness=props.cubeness, cube_axes=A, pins=pins,
-                device=props.device, target=props.target_shape,
-                roundness=props.roundness,
-                keep_orientation=props.keep_orientation)
-            if warn:
-                self.report({'WARNING'}, f"{ob.name}: {warn}")
+            stylizer, device, _ = create_stylizer(context, V0, F, props.cubeness,
+                                                  cube_axes(props), pins)
         except Exception as exc:
             self.report({'ERROR'}, f"{ob.name}: solver setup failed ({exc})")
             return False
+
+        try:
+            # Solve every step first, so a failure leaves the mesh untouched.
+            # Each step is warm-started from the previous one, which stays on
+            # the server (warm_last) instead of being re-sent.
+            wm = context.window_manager
+            steps = props.anim_samples
+            results = []
+            t0 = time.time()
+            for k in range(1, steps + 1):
+                if props.anim_mode == 'LAMBDA':
+                    stylizer.lam = props.cubeness * k / steps
+                    iters = props.anim_iters
+                else:
+                    iters = 1
+                try:
+                    V = stylizer.solve(warm_last=True, iterations=iters,
+                                       admm_iters=props.admm_iterations)
+                except Exception as exc:
+                    self.report({'ERROR'}, f"{ob.name}: solver failed at step {k} ({exc})")
+                    return False
+                if not np.all(np.isfinite(V)):
+                    self.report({'ERROR'}, f"{ob.name}: invalid positions at step {k}")
+                    return False
+                if props.auto_fix_walls:
+                    # only the baked key is fixed; the solver keeps
+                    # warm-starting from its own unfixed result
+                    try:
+                        V, _ = fix_walls(context, V0, V, F)
+                    except Exception as exc:
+                        self.report({'ERROR'},
+                                    f"{ob.name}: thin-wall fix failed at step {k} ({exc})")
+                        return False
+                results.append(V)
+                wm.progress_update(int(100 * (base + span * k / steps)))
+        finally:
+            stylizer.close()
 
         # Basis = untouched original; every step is its own absolute key.
         # Only shape-key point positions are written: base mesh vertices,
@@ -375,30 +560,10 @@ class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
         ob.shape_key_add(name="Basis", from_mix=False)
         key = me.shape_keys
         key.use_relative = False
-
-        wm = context.window_manager
-        steps = props.anim_samples
-        V = V0.copy()
-        t0 = time.time()
-        for k in range(1, steps + 1):
-            if props.anim_mode == 'LAMBDA':
-                stylizer.lam = props.cubeness * k / steps
-                iters = props.anim_iters
-            else:
-                iters = 1
-            try:
-                V = stylizer.solve(V_init=V, iterations=iters,
-                                   admm_iters=props.admm_iterations)
-            except Exception as exc:
-                self.report({'ERROR'}, f"{ob.name}: solver failed at step {k} ({exc})")
-                return False
-            if not np.all(np.isfinite(V)):
-                self.report({'ERROR'}, f"{ob.name}: invalid positions at step {k}")
-                return False
+        for k, V in enumerate(results, start=1):
             kb = ob.shape_key_add(name=f"Cubify {k:03d}", from_mix=False)
             kb.interpolation = 'KEY_LINEAR'
             kb.data.foreach_set("co", np.asarray(V, dtype=np.float32).ravel())
-            wm.progress_update(int(100 * (base + span * k / steps)))
 
         # Play the key sequence across the timeline: eval_time runs linearly
         # from the Basis key's position to the last key's.
@@ -408,11 +573,7 @@ class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
         key.keyframe_insert(data_path="eval_time", frame=f0)
         key.eval_time = key.key_blocks[-1].frame
         key.keyframe_insert(data_path="eval_time", frame=f1)
-        if key.animation_data and key.animation_data.action:
-            for fc in key.animation_data.action.fcurves:
-                if fc.data_path == "eval_time":
-                    for kp in fc.keyframe_points:
-                        kp.interpolation = 'LINEAR'
+        _linear_eval_time(key)
 
         mode = ("cubeness ramp" if props.anim_mode == 'LAMBDA'
                 else "iterations")
@@ -422,13 +583,33 @@ class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
         return True
 
 
-class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
+def _linear_eval_time(key):
+    """Linear interpolation on the eval_time keyframes. Blender 4.4+ stores
+    f-curves in layered actions (channelbags), older versions on the action."""
+    ad = key.animation_data
+    if not ad or not ad.action:
+        return
+    fcurves = getattr(ad.action, "fcurves", None)
+    if fcurves is None:
+        try:
+            from bpy_extras import anim_utils
+            bag = anim_utils.action_get_channelbag_for_slot(ad.action, ad.action_slot)
+            fcurves = bag.fcurves if bag else []
+        except Exception:
+            fcurves = []
+    for fc in fcurves:
+        if fc.data_path == "eval_time":
+            for kp in fc.keyframe_points:
+                kp.interpolation = 'LINEAR'
+
+
+class OBJECT_OT_cubify_cpp_bake_frames(bpy.types.Operator):
     """Cubify the animated mesh at every sampled frame of the scene range
     and bake the results onto a NEW copy object as shape keys over the
     timeline. The copy follows the original's animation (object transforms,
     shape keys, armatures, deforming modifiers — evaluated in world space)
     with each frame re-cubified; the original is untouched"""
-    bl_idname = "object.cubify_bake_frames"
+    bl_idname = "object.cubify_cpp_bake_frames"
     bl_label = "Cubify Every Frame (to Copy)"
     bl_description = 'Stylize each sampled animation frame and bake shape keys onto a new copy'
     bl_options = {'REGISTER', 'UNDO'}
@@ -439,7 +620,7 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
         return (context.mode == 'OBJECT' and ob is not None and ob.type == 'MESH')
 
     def execute(self, context):
-        props = context.scene.cubify_settings
+        props = context.scene.cubify_cpp_settings
         if props.cubeness <= 0.0:
             self.report({'ERROR'}, "Cubeness is 0 — nothing to cubify")
             return {'CANCELLED'}
@@ -478,8 +659,7 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
                             f"{ob.name}: pins ignored (modifiers change the "
                             "vertex count)")
 
-            A = np.array(Euler(props.orientation, 'XYZ').to_matrix(),
-                         dtype=np.float64)
+            A = cube_axes(props)
 
             new_ob = bpy.data.objects.new(ob.name + "_cubified_anim", me0)
             context.collection.objects.link(new_ob)
@@ -489,7 +669,7 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
             key.use_relative = False
 
             # ---- per-frame solve
-            device = warned = None
+            device = None
             t0 = time.time()
             for i, f in enumerate(frames):
                 scene.frame_set(f)
@@ -512,19 +692,18 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
                 # from the previous result: ARAP leaves the output's global
                 # rotation free, so the cube term would turn an already
                 # cubified shape back to its earlier orientation and the
-                # bake would stop following the animation.
-                stylizer, device, warn = solver.create_stylizer(
-                    Vw, F, cubeness=props.cubeness, cube_axes=A_f, pins=pins,
-                    device=props.device, target=props.target_shape,
-                    roundness=props.roundness,
-                    keep_orientation=props.keep_orientation)
-                if warn and not warned:
-                    self.report({'WARNING'}, f"{ob.name}: {warn}")
-                    warned = True
-                V_out = stylizer.run(iterations=props.iterations,
-                                     admm_iters=props.admm_iterations)
+                # bake would stop following the animation. The rest pose
+                # changes every frame, so each frame also needs its own
+                # system (cotan weights depend on it).
+                stylizer, device, _ = create_stylizer(context, Vw, F, props.cubeness,
+                                                      A_f, pins)
+                with stylizer:
+                    V_out = stylizer.run(iterations=props.iterations,
+                                         admm_iters=props.admm_iterations)
                 if not np.all(np.isfinite(V_out)):
                     raise RuntimeError(f"invalid positions at frame {f}")
+                if props.auto_fix_walls:
+                    V_out, _ = fix_walls(context, Vw, V_out, F)
 
                 kb = new_ob.shape_key_add(name=f"Frame {f:04d}", from_mix=False)
                 kb.interpolation = 'KEY_LINEAR'
@@ -533,11 +712,7 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
                 key.keyframe_insert(data_path="eval_time", frame=f)
                 wm.progress_update(int(100 * (i + 1) / len(frames)))
 
-            if key.animation_data and key.animation_data.action:
-                for fc in key.animation_data.action.fcurves:
-                    if fc.data_path == "eval_time":
-                        for kp in fc.keyframe_points:
-                            kp.interpolation = 'LINEAR'
+            _linear_eval_time(key)
 
             self.report({'INFO'},
                         f"{new_ob.name}: {len(frames)} frames "
@@ -558,10 +733,10 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
 
 # ================== Pin management
 
-class OBJECT_OT_cubify_pins(bpy.types.Operator):
+class OBJECT_OT_cubify_cpp_pins(bpy.types.Operator):
     """Manage the pinned (handle) vertices stored in the 'CubifyPins'
     vertex group"""
-    bl_idname = "object.cubify_pins"
+    bl_idname = "object.cubify_cpp_pins"
     bl_label = "Cubify Pins"
     bl_description = 'Set, add, or clear the vertices used as fixed anchors and drag handles'
     bl_options = {'REGISTER', 'UNDO'}
@@ -621,11 +796,11 @@ class OBJECT_OT_cubify_pins(bpy.types.Operator):
 
 # ================== Interactive ARAP manipulation
 
-class OBJECT_OT_arap_manipulate(bpy.types.Operator):
-    """Interactive ARAP deformation: drag pinned vertices and the mesh
-    follows as-rigidly-as-possible. Click near a pin to grab it, drag to
-    deform, Enter/Space to confirm, Esc/right-click to cancel"""
-    bl_idname = "object.arap_manipulate"
+class OBJECT_OT_arap_cpp_manipulate(bpy.types.Operator):
+    """Interactive ARAP deformation (C++ solver): drag pinned vertices and
+    the mesh follows as-rigidly-as-possible. Click near a pin to grab it,
+    drag to deform, Enter/Space to confirm, Esc/right-click to cancel"""
+    bl_idname = "object.arap_cpp_manipulate"
     bl_label = "Start Manipulation"
     bl_description = 'Drag pinned vertices to deform the mesh; Enter confirms and Esc cancels'
     bl_options = {'REGISTER', 'UNDO'}
@@ -652,19 +827,17 @@ class OBJECT_OT_arap_manipulate(bpy.types.Operator):
             self.report({'ERROR'}, "Must be run from a 3D Viewport")
             return {'CANCELLED'}
 
-        props = context.scene.cubify_settings
+        props = context.scene.cubify_cpp_settings
         V, F = read_mesh_arrays(me)
         lam = props.cubeness if props.stylized_drag else 0.0
-        A = np.array(Euler(props.orientation, 'XYZ').to_matrix(), dtype=np.float64)
 
         try:
-            self.solver, device, warn = solver.create_stylizer(
-                V, F, cubeness=lam, cube_axes=A, pins=pins,
-                device=props.device, target=props.target_shape,
-                roundness=props.roundness,
-                keep_orientation=props.keep_orientation)
-            if warn:
-                self.report({'WARNING'}, warn)
+            # factorized once here; every drag only re-solves on the server
+            # (Square Flat Regions would refactorize every iteration, so it
+            # stays off for interactive drags)
+            self.solver, device, _ = create_stylizer(context, V, F, lam,
+                                                     cube_axes(props), pins,
+                                                     allow_square_flat=False)
         except Exception as exc:
             self.report({'ERROR'}, f"Solver setup failed ({exc})")
             return {'CANCELLED'}
@@ -691,7 +864,7 @@ class OBJECT_OT_arap_manipulate(bpy.types.Operator):
             self._draw_pins, (), 'WINDOW', 'POST_VIEW')
 
         context.workspace.status_text_set(
-            "ARAP Manipulation  |  Left-drag a pin to deform  |  "
+            f"ARAP Manipulation ({device})  |  Left-drag a pin to deform  |  "
             "Enter/Space: confirm  |  Esc/Right-click: cancel")
         context.window_manager.modal_handler_add(self)
         self.area.tag_redraw()
@@ -742,8 +915,10 @@ class OBJECT_OT_arap_manipulate(bpy.types.Operator):
         target_local = mw.inverted() @ target_world
         self.pin_pos[self.grab] = np.array(target_local, dtype=np.float64)
 
+        # warm-start from the server's copy of the previous result (identical
+        # to self.V_cur) so only the pin targets travel over the pipe
         self.V_cur = self.solver.solve(
-            pin_pos=self.pin_pos, V_init=self.V_cur,
+            pin_pos=self.pin_pos, warm_last=True,
             iterations=self.drag_iters, admm_iters=self.admm_iters)
         write_mesh_positions(self.ob.data, self.V_cur)
         self.area.tag_redraw()
@@ -752,6 +927,7 @@ class OBJECT_OT_arap_manipulate(bpy.types.Operator):
         bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
         context.workspace.status_text_set(None)
         self.area.tag_redraw()
+        self.solver.close()
 
     # ---- modal loop
 
@@ -796,7 +972,7 @@ class OBJECT_OT_arap_manipulate(bpy.types.Operator):
 
 # ================== Panel
 
-class VIEW3D_PT_cubify(bpy.types.Panel):
+class VIEW3D_PT_cubify_cpp(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Cubify"
@@ -804,146 +980,35 @@ class VIEW3D_PT_cubify(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.cubify_settings
-        ob = context.active_object
+        props = context.scene.cubify_cpp_settings
 
-        if ob is not None and ob.type == 'MESH' and ob.data is not None:
-            me = ob.data
-            kind, tris, quads, ngons = mesh_kind(me)
-            box = layout.box()
-            box.label(text=f"{ob.name}: {len(me.vertices)} verts", icon='MESH_DATA')
-            box.label(text=f"{kind} ({tris} tris, {quads} quads"
-                           + (f", {ngons} n-gons)" if ngons else ")"),
-                      icon='MESH_GRID' if quads and not tris else 'MESH_ICOSPHERE')
-            if quads or ngons:
-                box.label(text="Solved on virtual triangulation;", icon='INFO')
-                box.label(text="topology and UVs are preserved")
-            n_pins = (len(get_pin_indices(ob)) if len(me.vertices) <= 100000
-                      else None)
-            if n_pins is None:
-                box.label(text=f"Pins: group '{PIN_GROUP}'", icon='PINNED')
-            else:
-                box.label(text=f"Pins: {n_pins}", icon='PINNED')
-
-        layout.prop(props, "target_shape")
+        layout.prop(props, "cubeness", slider=True)
         if props.target_shape == 'ROUNDED_CUBE':
             layout.prop(props, "roundness", slider=True)
-        col = layout.column(align=True)
-        col.prop(props, "cubeness")
-        col.prop(props, "iterations")
-        col.prop(props, "admm_iterations")
-        layout.prop(props, "device")
-        info = solver.torch_device_info_cached()
-        if info is not None:
-            has_torch, cuda, mps = info
-            if props.device in {'CUDA', 'MPS'} and not has_torch:
-                layout.label(text="PyTorch not installed: will use CPU",
-                             icon='ERROR')
-                op = layout.operator("preferences.addon_show",
-                                     text="Install in Add-on Preferences",
-                                     icon='PREFERENCES')
-                op.module = __package__
-            elif props.device == 'CUDA' and not cuda:
-                layout.label(text="CUDA not available: will use CPU",
-                             icon='ERROR')
-            elif props.device == 'MPS' and not mps:
-                layout.label(text="MPS not available: will use CPU",
-                             icon='ERROR')
-            elif props.device in {'CUDA', 'MPS'} and props.target_shape != 'CUBE':
-                layout.label(text="GPU supports Cube only: will use CPU",
-                             icon='INFO')
-        layout.prop(props, "orientation")
-        layout.prop(props, "keep_orientation")
+        layout.prop(props, "target_shape", text="Shape Type")
+        layout.prop(props, "repeat")
+        layout.prop(props, "square_flat")
         layout.prop(props, "apply_to_copy")
-        layout.operator(OBJECT_OT_cubify.bl_idname, icon='MESH_CUBE')
-
-        layout.separator()
-        box = layout.box()
-        box.label(text="Style as Process", icon='SHAPEKEY_DATA')
-        row = box.row(align=True)
-        row.prop(props, "anim_mode", expand=True)
-        col = box.column(align=True)
-        col.prop(props, "anim_samples")
-        if props.anim_mode == 'LAMBDA':
-            col.prop(props, "anim_iters")
-        col.prop(props, "anim_frame_step")
-        box.operator(OBJECT_OT_cubify_bake_anim.bl_idname, icon='RENDER_ANIMATION')
-        box.prop(props, "anim_axes")
-        box.operator(OBJECT_OT_cubify_bake_frames.bl_idname, icon='DUPLICATE')
-
-        layout.separator()
-        box = layout.box()
-        box.label(text="ARAP Manipulation", icon='VIEW_PAN')
-        row = box.row(align=True)
-        op = row.operator(OBJECT_OT_cubify_pins.bl_idname, text="Set Pins")
-        op.action = 'SET'
-        op = row.operator(OBJECT_OT_cubify_pins.bl_idname, text="Add")
-        op.action = 'ADD'
-        op = row.operator(OBJECT_OT_cubify_pins.bl_idname, text="Clear")
-        op.action = 'CLEAR'
-        box.prop(props, "stylized_drag")
-        box.prop(props, "drag_iterations")
-        box.operator(OBJECT_OT_arap_manipulate.bl_idname, icon='ORIENTATION_GIMBAL')
+        layout.operator(OBJECT_OT_cubify_cpp.bl_idname, icon='MESH_CUBE')
+        layout.operator(OBJECT_OT_cubify_cpp_bake_anim.bl_idname,
+                        text="Bake Animation", icon='RENDER_ANIMATION')
 
 
-# ================== Preferences: one-click PyTorch install
+# ================== Preferences: server status and one-click build
 
-# Install state shared between the worker thread, the watcher timer and the
-# preferences UI. Only the worker writes ok/msg/used_user; the UI only reads.
-_TORCH_INSTALL = {"thread": None, "ok": None, "msg": "", "used_user": False}
-
-
-def _torch_pip_command():
-    """The pip command for this platform.
-
-    macOS: the default PyPI wheel ships MPS support. Linux: the default
-    wheel bundles CUDA. Windows: the default wheel is CPU-only, so the
-    CUDA index is needed.
-    """
-    cmd = [sys.executable, "-m", "pip", "install", "torch"]
-    if sys.platform.startswith("win"):
-        cmd += ["--index-url", "https://download.pytorch.org/whl/cu126"]
-    return cmd
+# Build state shared between the worker thread, the watcher timer and the
+# preferences UI. Only the worker writes ok/msg; the UI only reads.
+_BUILD = {"thread": None, "ok": None, "msg": ""}
 
 
-def _user_site_dir():
-    try:
-        return site.getusersitepackages()
-    except Exception:
-        return None
-
-
-def _install_torch_worker():
+def _build_worker():
     """Runs in a background thread so Blender stays responsive during the
-    (possibly multi-GB) download. subprocess only — no bpy access here."""
-    def run(cmd):
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=True)
-        print(proc.stdout)  # full pip log to the system console
-        return proc
-
+    build (the first one also downloads Eigen). No bpy access here."""
     try:
-        run([sys.executable, "-m", "ensurepip", "--upgrade"])  # pip may be absent
-        proc = run(_torch_pip_command())
-        out = proc.stdout or ""
-        if proc.returncode != 0 and ("ermission denied" in out
-                                     or "ccess is denied" in out
-                                     or "WinError 5" in out):
-            # site-packages not writable (e.g. Blender in Program Files):
-            # retry in the per-user site, which register() adds to sys.path
-            _TORCH_INSTALL["used_user"] = True
-            proc = run(_torch_pip_command() + ["--user"])
-            out = proc.stdout or ""
-        if proc.returncode != 0:
-            tail = "\n".join(out.strip().splitlines()[-3:])
-            _TORCH_INSTALL["ok"] = False
-            _TORCH_INSTALL["msg"] = ("pip failed — see the system console. "
-                                     + tail)
-        else:
-            _TORCH_INSTALL["ok"] = True
+        ok, msg = builder.build(log=print)  # full CMake log to the system console
+        _BUILD["ok"], _BUILD["msg"] = ok, msg
     except Exception as exc:
-        _TORCH_INSTALL["ok"] = False
-        _TORCH_INSTALL["msg"] = f"install failed: {exc}"
+        _BUILD["ok"], _BUILD["msg"] = False, f"build failed: {exc}"
 
 
 def _redraw_preferences():
@@ -956,142 +1021,126 @@ def _redraw_preferences():
         pass
 
 
-def _watch_install():
+def _watch_build():
     """bpy.app.timers callback: poll the worker, then probe the result."""
-    thread = _TORCH_INSTALL["thread"]
+    thread = _BUILD["thread"]
     if thread is not None and thread.is_alive():
         _redraw_preferences()
         return 0.5
-    _TORCH_INSTALL["thread"] = None
-    if _TORCH_INSTALL["ok"]:
-        if _TORCH_INSTALL["used_user"]:
-            usersite = _user_site_dir()
-            if usersite and usersite not in sys.path:
-                sys.path.append(usersite)
-        solver.reset_torch_info()
-        has_torch, cuda, mps = solver.torch_device_info()
-        if has_torch:
-            _TORCH_INSTALL["msg"] = (
-                "PyTorch installed — " + _device_summary(cuda, mps))
-        else:
-            _TORCH_INSTALL["ok"] = False
-            _TORCH_INSTALL["msg"] = ("installed, but import failed — "
-                                     "restart Blender and check again")
+    _BUILD["thread"] = None
+    if _BUILD["ok"]:
+        try:
+            server = client.get_server(server_path())
+            _BUILD["msg"] = f"Built — {server.version}"
+        except Exception as exc:
+            _BUILD["ok"] = False
+            _BUILD["msg"] = f"built, but the server does not start: {exc}"
     _redraw_preferences()
     return None
 
 
-def _device_summary(cuda, mps):
-    if cuda:
-        return "CUDA GPU available"
-    if mps:
-        return "Metal GPU (MPS) available"
-    return "no GPU device available (CPU-only build or no GPU)"
-
-
-class CUBIFY_OT_probe_torch(bpy.types.Operator):
-    """Check whether PyTorch and a GPU device are available in Blender's
-    Python (imports torch, which can take a few seconds)"""
-    bl_idname = "cubify.probe_torch"
-    bl_label = "Check PyTorch"
-    bl_description = 'Check whether Blender can use PyTorch and a supported GPU'
+class CUBIFY_CPP_OT_check_server(bpy.types.Operator):
+    """Start the C++ server (restarting it if running) and report its version"""
+    bl_idname = "cubify_cpp.check_server"
+    bl_label = "Check Server"
+    bl_description = 'Restart the C++ solver server and check its version and available threads'
 
     def execute(self, context):
-        solver.reset_torch_info()
-        has_torch, cuda, mps = solver.torch_device_info()
-        if not has_torch:
-            _TORCH_INSTALL["msg"] = "PyTorch is not installed"
-        else:
-            try:
-                import torch
-                ver = torch.__version__
-            except Exception:
-                ver = "?"
-            _TORCH_INSTALL["msg"] = f"PyTorch {ver} — {_device_summary(cuda, mps)}"
+        client.shutdown_server()
+        try:
+            server = client.get_server(server_path(context))
+            _BUILD.update(ok=True, msg=f"{server.version} — "
+                          f"{server.hardware_threads} hardware threads")
+        except Exception as exc:
+            _BUILD.update(ok=False, msg=str(exc))
         return {'FINISHED'}
 
 
-class CUBIFY_OT_install_torch(bpy.types.Operator):
-    """Download and install PyTorch into Blender's own Python with pip.
-    Runs in the background; Blender stays usable. The GPU build is large
-    (macOS ~250 MB, Windows CUDA ~3 GB)"""
-    bl_idname = "cubify.install_torch"
-    bl_label = "Install PyTorch"
-    bl_description = 'Download and install PyTorch in the background to enable GPU solving'
+class CUBIFY_CPP_OT_build_server(bpy.types.Operator):
+    """Compile the C++ server from the bundled source with CMake. Needs CMake
+    and a C++17 compiler; the first build downloads Eigen. Runs in the
+    background; Blender stays usable"""
+    bl_idname = "cubify_cpp.build_server"
+    bl_label = "Build Server"
+    bl_description = 'Compile the C++ solver in the background; requires CMake and a C++17 compiler'
 
     def execute(self, context):
-        if _TORCH_INSTALL["thread"] is not None:
-            self.report({'WARNING'}, "Install already running")
+        if _BUILD["thread"] is not None:
+            self.report({'WARNING'}, "Build already running")
             return {'CANCELLED'}
-        _TORCH_INSTALL.update(ok=None, msg="Installing… (progress in the "
-                              "system console)", used_user=False)
-        thread = threading.Thread(target=_install_torch_worker, daemon=True)
-        _TORCH_INSTALL["thread"] = thread
+        # a running server locks its executable on Windows
+        client.shutdown_server()
+        _BUILD.update(ok=None, msg="Building… (progress in the system console)")
+        thread = threading.Thread(target=_build_worker, daemon=True)
+        _BUILD["thread"] = thread
         thread.start()
-        bpy.app.timers.register(_watch_install, first_interval=0.5)
-        self.report({'INFO'}, "PyTorch install started in the background")
+        bpy.app.timers.register(_watch_build, first_interval=0.5)
+        self.report({'INFO'}, "C++ server build started in the background")
         return {'FINISHED'}
 
 
-class CubifyPreferences(bpy.types.AddonPreferences):
+class CubifyCppPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
+
+    server_path: bpy.props.StringProperty(
+        name="Server Executable",
+        description="Path to a cubify_server executable. Leave empty to use "
+                    "the one built into the add-on's bin folder",
+        subtype='FILE_PATH', default="")
 
     def draw(self, context):
         layout = self.layout
         box = layout.box()
-        box.label(text="GPU solver (PyTorch)", icon='SYSTEM')
+        box.label(text="C++ solver server", icon='SYSTEM')
 
-        installing = _TORCH_INSTALL["thread"] is not None
-        info = solver.torch_device_info_cached()
-        if installing:
-            box.label(text=_TORCH_INSTALL["msg"], icon='SORTTIME')
-        elif _TORCH_INSTALL["msg"]:
-            icon = 'ERROR' if _TORCH_INSTALL["ok"] is False else 'CHECKMARK'
-            box.label(text=_TORCH_INSTALL["msg"], icon=icon)
-        elif info is not None:
-            has_torch, cuda, mps = info
-            if has_torch:
-                box.label(text="PyTorch installed — " + _device_summary(cuda, mps),
-                          icon='CHECKMARK')
-            else:
-                box.label(text="PyTorch not installed (CPU solver is used)",
-                          icon='INFO')
+        building = _BUILD["thread"] is not None
+        path = client.resolve_server_path(self.server_path)
+        running = client.server_cached()
+        if building:
+            box.label(text=_BUILD["msg"], icon='SORTTIME')
+        elif _BUILD["msg"]:
+            icon = 'ERROR' if _BUILD["ok"] is False else 'CHECKMARK'
+            box.label(text=_BUILD["msg"], icon=icon)
+        elif running is not None:
+            box.label(text=f"Running — {running.version}", icon='CHECKMARK')
+        elif os.path.isfile(path):
+            box.label(text="Server built (starts on first use)", icon='CHECKMARK')
         else:
-            box.label(text="PyTorch not checked yet", icon='QUESTION')
+            box.label(text="Server not built yet", icon='ERROR')
+
+        box.prop(self, "server_path")
+        box.label(text="Using: " + path)
 
         row = box.row(align=True)
-        row.enabled = not installing
-        row.operator(CUBIFY_OT_probe_torch.bl_idname, icon='VIEWZOOM')
-        row.operator(CUBIFY_OT_install_torch.bl_idname, icon='IMPORT')
+        row.enabled = not building
+        row.operator(CUBIFY_CPP_OT_check_server.bl_idname, icon='VIEWZOOM')
+        row.operator(CUBIFY_CPP_OT_build_server.bl_idname, icon='TOOL_SETTINGS')
 
-        size = "~3 GB (CUDA build)" if sys.platform.startswith("win") else "~250 MB"
-        box.label(text=f"Optional — only speeds up meshes over ~20k vertices. "
-                       f"Download is {size}.")
-        box.label(text="Command: " + " ".join(_torch_pip_command()))
+        cmake = builder.find_cmake()
+        box.label(text="CMake: " + (cmake or "not found — install CMake and a "
+                                     "C++17 compiler to build"))
+        box.label(text="Terminal alternative: python builder.py (in the add-on folder)")
 
 
 # ================== Registration
 
-_classes = (CubifySettings, OBJECT_OT_cubify, OBJECT_OT_cubify_bake_anim,
-            OBJECT_OT_cubify_bake_frames, OBJECT_OT_cubify_pins,
-            OBJECT_OT_arap_manipulate, VIEW3D_PT_cubify,
-            CUBIFY_OT_probe_torch, CUBIFY_OT_install_torch, CubifyPreferences)
+# Distribution exposes only mesh stylization and the animation bake.
+# Server maintenance remains available in add-on preferences.
+_classes = (CubifyCppSettings, OBJECT_OT_cubify_cpp,
+            OBJECT_OT_cubify_cpp_bake_anim, VIEW3D_PT_cubify_cpp,
+            CUBIFY_CPP_OT_check_server, CUBIFY_CPP_OT_build_server,
+            CubifyCppPreferences)
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.cubify_settings = bpy.props.PointerProperty(type=CubifySettings)
-    # a previous session may have pip-installed torch with --user (Blender
-    # does not load the user site by default) — make it importable
-    usersite = _user_site_dir()
-    if (usersite and usersite not in sys.path
-            and os.path.isdir(os.path.join(usersite, "torch"))):
-        sys.path.append(usersite)
+    bpy.types.Scene.cubify_cpp_settings = bpy.props.PointerProperty(type=CubifyCppSettings)
 
 
 def unregister():
-    del bpy.types.Scene.cubify_settings
+    client.shutdown_server()
+    del bpy.types.Scene.cubify_cpp_settings
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
