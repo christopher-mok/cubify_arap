@@ -5,6 +5,8 @@ solver. The full interface and development documentation are on `main`.
 
 ## Install
 
+[Download cubic_stylization.zip](https://github.com/christopher-mok/cubify_arap/raw/refs/heads/distribution/cubic_stylization.zip)
+
 In Blender, open **Edit → Preferences → Add-ons → Install…**, select
 `cubic_stylization.zip`, and enable **Mesh: Cubic Stylization**.
 Open the 3D Viewport sidebar (**N**) → **Cubify** tab.
