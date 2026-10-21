@@ -117,10 +117,7 @@ class CubifySettings(bpy.types.PropertyGroup):
         ], default='CUBE')
     keep_orientation: bpy.props.BoolProperty(
         name="Keep Orientation",
-        description="Stop the whole mesh from turning to line its large flat "
-                    "areas up with the target's faces (e.g. a head turning "
-                    "10-14 degrees under Cube or Octahedron): the shape is stylized in place. "
-                    "No effect with pins, which already hold the orientation",
+        description='Stylize without rotating the whole mesh; pins already hold its orientation',
         default=False)
     roundness: bpy.props.FloatProperty(
         name="Roundness",
@@ -129,8 +126,7 @@ class CubifySettings(bpy.types.PropertyGroup):
         default=0.5, min=0.0, max=1.0, subtype='FACTOR')
     cubeness: bpy.props.FloatProperty(
         name="Cubeness",
-        description="Strength of the stylization term (lambda). 0 is plain "
-                    "ARAP; 0.2-1.0 gives an increasingly strong target shape",
+        description='Control stylization strength: 0 disables it; higher values emphasize the target shape',
         default=0.2, min=0.0, soft_max=5.0, max=20.0, step=1, precision=2)
     orientation: bpy.props.FloatVectorProperty(
         name="Cube Orientation",
@@ -138,12 +134,11 @@ class CubifySettings(bpy.types.PropertyGroup):
         subtype='EULER', default=(0.0, 0.0, 0.0))
     iterations: bpy.props.IntProperty(
         name="Iterations",
-        description="Local-global solver iterations",
+        description='Solver passes: higher values refine the result but take longer',
         default=30, min=1, max=500)
     admm_iterations: bpy.props.IntProperty(
         name="ADMM Iterations",
-        description="Maximum inner ADMM iterations per rotation fit "
-                    "(stops early on convergence)",
+        description='Rotation-fitting passes per solver step: higher values improve convergence but take longer',
         default=100, min=1, max=300)
     apply_to_copy: bpy.props.BoolProperty(
         name="Apply to Copy",
@@ -151,13 +146,11 @@ class CubifySettings(bpy.types.PropertyGroup):
         default=False)
     stylized_drag: bpy.props.BoolProperty(
         name="Stylized Drag",
-        description="Use the current Cubeness during ARAP manipulation, so "
-                    "dragging preserves the cubic style (0 = classic ARAP)",
+        description='Apply the current target shape and Cubeness while dragging pinned vertices',
         default=False)
     drag_iterations: bpy.props.IntProperty(
         name="Drag Iterations",
-        description="Local-global iterations per mouse move while dragging "
-                    "(higher is stiffer/more converged but slower)",
+        description='Solver passes per mouse move: higher values refine dragging but respond more slowly',
         default=2, min=1, max=20)
     anim_mode: bpy.props.EnumProperty(
         name="Animate By",
@@ -177,14 +170,11 @@ class CubifySettings(bpy.types.PropertyGroup):
         default=20, min=2, max=200)
     anim_iters: bpy.props.IntProperty(
         name="Iterations / Step",
-        description="Warm-started solver iterations per step (Cubeness Ramp "
-                    "mode). Raise it if the final frames look unconverged",
+        description='Solver passes per Cubeness Ramp step: increase if the final shape needs more refinement',
         default=3, min=1, max=50)
     anim_frame_step: bpy.props.IntProperty(
         name="Frame Step",
-        description="Timeline frames between baked steps. Style-as-process "
-                    "bakes start at the current frame; Cubify Every Frame "
-                    "samples the scene frame range at this step",
+        description='Frames between baked steps or samples; higher values make frame sampling less frequent',
         default=2, min=1, max=50)
     anim_axes: bpy.props.EnumProperty(
         name="Cube Axes",
@@ -219,6 +209,7 @@ class OBJECT_OT_cubify(bpy.types.Operator):
     are preserved. Pinned vertices are held in place"""
     bl_idname = "object.cubify_mesh"
     bl_label = "Cubify Mesh"
+    bl_description = 'Reshape selected meshes toward the target shape while keeping pinned vertices fixed'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -316,6 +307,7 @@ class OBJECT_OT_cubify_bake_anim(bpy.types.Operator):
     to get the original back"""
     bl_idname = "object.cubify_bake_animation"
     bl_label = "Bake Animation (Shape Keys)"
+    bl_description = 'Animate the stylization process by baking each step into a shape key'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -438,6 +430,7 @@ class OBJECT_OT_cubify_bake_frames(bpy.types.Operator):
     with each frame re-cubified; the original is untouched"""
     bl_idname = "object.cubify_bake_frames"
     bl_label = "Cubify Every Frame (to Copy)"
+    bl_description = 'Stylize each sampled animation frame and bake shape keys onto a new copy'
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -570,6 +563,7 @@ class OBJECT_OT_cubify_pins(bpy.types.Operator):
     vertex group"""
     bl_idname = "object.cubify_pins"
     bl_label = "Cubify Pins"
+    bl_description = 'Set, add, or clear the vertices used as fixed anchors and drag handles'
     bl_options = {'REGISTER', 'UNDO'}
 
     action: bpy.props.EnumProperty(items=[
@@ -577,6 +571,14 @@ class OBJECT_OT_cubify_pins(bpy.types.Operator):
         ('ADD', "Add Selection", "Add the selected vertices to the pins"),
         ('CLEAR', "Clear", "Remove all pins"),
     ], default='SET')
+
+    @classmethod
+    def description(cls, context, properties):
+        return {
+            'SET': "Replace all pins with the selected vertices",
+            'ADD': "Add the selected vertices to the existing pins",
+            'CLEAR': "Remove all pins so no vertices are held fixed",
+        }.get(properties.action, cls.bl_description)
 
     @classmethod
     def poll(cls, context):
@@ -625,6 +627,7 @@ class OBJECT_OT_arap_manipulate(bpy.types.Operator):
     deform, Enter/Space to confirm, Esc/right-click to cancel"""
     bl_idname = "object.arap_manipulate"
     bl_label = "Start Manipulation"
+    bl_description = 'Drag pinned vertices to deform the mesh; Enter confirms and Esc cancels'
     bl_options = {'REGISTER', 'UNDO'}
 
     _PICK_RADIUS_PX = 30.0
@@ -991,6 +994,7 @@ class CUBIFY_OT_probe_torch(bpy.types.Operator):
     Python (imports torch, which can take a few seconds)"""
     bl_idname = "cubify.probe_torch"
     bl_label = "Check PyTorch"
+    bl_description = 'Check whether Blender can use PyTorch and a supported GPU'
 
     def execute(self, context):
         solver.reset_torch_info()
@@ -1013,6 +1017,7 @@ class CUBIFY_OT_install_torch(bpy.types.Operator):
     (macOS ~250 MB, Windows CUDA ~3 GB)"""
     bl_idname = "cubify.install_torch"
     bl_label = "Install PyTorch"
+    bl_description = 'Download and install PyTorch in the background to enable GPU solving'
 
     def execute(self, context):
         if _TORCH_INSTALL["thread"] is not None:

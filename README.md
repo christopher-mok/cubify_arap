@@ -1,6 +1,6 @@
-# Cubic Stylization + ARAP — Blender Add-on
+# Cubic Stylization + ARAP — Blender Add-on (C++ server)
 
-A Blender add-on with two tools built on the same solver:
+The primary add-on is `cubic_stylization_c++/`: Blender handles the UI and mesh I/O, while a native C++/Eigen server runs the solver over stdin/stdout. It provides two tools:
 
 - **Cubic Stylization** (Hsueh-Ti Derek Liu & Alec Jacobson, SIGGRAPH Asia
   2019): an as-rigid-as-possible deformation with an L1 penalty on rotated
@@ -19,64 +19,25 @@ mixed mesh.
 ## Install
 
 1. In Blender: **Edit → Preferences → Add-ons → Install…**
-2. Pick `cubic_stylization.zip` (or zip the `cubic_stylization/` folder yourself).
-3. Enable **Mesh: Cubic Stylization** in the add-on list.
+2. Pick `cubic_stylization_c++.zip` and enable **Mesh: Cubic Stylization (C++)**.
+3. Open the 3D Viewport sidebar (**N**) → **Cubify C++** tab.
 
-Requires Blender 2.93+ and numpy (bundled with Blender). If scipy is present
-in Blender's Python it is used for a faster prefactorized sparse solve;
-otherwise a dependency-free conjugate-gradient fallback is used automatically —
-results are identical.
+The C++ server starts automatically when needed. Use **Threads** to choose
+CPU parallelism (`0` uses all cores). PyTorch is not required. If a server
+binary for your platform is unavailable, use **Build Server** in the add-on
+preferences. See the [C++ add-on guide](cubic_stylization_c++/README.md) for
+build requirements, platform packaging, and C++-specific controls such as
+Repeat, Square Flat Regions, and Fix Thin Walls.
 
-## Device (CPU / CUDA / Metal)
-
-The **Device** dropdown selects where the solver runs:
-
-- **Auto** (default) — GPU for meshes ≥ 20k vertices when one is available,
-  CPU otherwise.
-- **CPU** — the numpy solver, always available.
-- **CUDA GPU** — NVIDIA GPUs, via PyTorch.
-- **Metal GPU (MPS)** — Apple GPUs, via PyTorch.
-
-GPU devices require PyTorch inside **Blender's own Python**. The easy way:
-**Edit → Preferences → Add-ons → Cubic Stylization → Install PyTorch** — a
-one-click background install into Blender's Python (macOS ~250 MB; Windows
-~3 GB, CUDA build). **Check PyTorch** on the same panel reports what's
-currently available. Manual alternative from a terminal:
-
-```sh
-# macOS (Apple GPU / MPS):
-/Applications/Blender.app/Contents/Resources/<ver>/python/bin/python3.* -m pip install torch
-
-# Linux (NVIDIA / CUDA — the default wheel bundles CUDA):
-<blender>/python/bin/python -m pip install torch
-
-# Windows (NVIDIA / CUDA): use the CUDA wheel index from pytorch.org, e.g.
-<blender>\python\bin\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126
-```
-
-If PyTorch or the requested device is missing, the add-on falls back to the
-CPU solver and reports a warning — nothing breaks. The GPU backend runs the
-whole local step (rotation fitting + ADMM) and right-hand-side assembly on
-the device in float32; rotations are fitted with a batched Newton
-polar-decomposition iteration (reflection cases handled exactly on-GPU via a
-closed-form symmetric 3x3 eigensolve), so no SVD kernels are needed. Results
-match the CPU solver to float32 precision.
-
-Measured on an Apple M2 Max (cubify, 10 iterations, λ=0.4):
-
-| vertices | CPU (numpy) | Metal (MPS) | speedup |
-|---------:|------------:|------------:|--------:|
-|   10,242 |       0.8 s |       1.5 s |    0.5× |
-|   40,962 |       3.5 s |       2.4 s |    1.4× |
-|  163,842 |      10.6 s |       4.0 s |    2.6× |
-
-GPU pays off for large meshes; for small ones the CPU path wins (which is
-what Auto does). CUDA uses the identical torch code path but could not be
-benchmarked on this machine.
+The Python add-on in `cubic_stylization/` remains available as a reference
+implementation and optional alternative. Install `cubic_stylization.zip`
+and enable **Mesh: Cubic Stylization** to use its **Cubify** tab. Its
+**Device** selector supports CPU and optional PyTorch CUDA/Metal backends;
+non-Cube targets use its CPU solver.
 
 ## Cubify
 
-1. 3D Viewport sidebar (**N**) → **Cubify** tab.
+1. 3D Viewport sidebar (**N**) → **Cubify C++** tab.
 2. Select one or more mesh objects (Object Mode) and adjust:
    - **Target Shape** — what surfaces are stylized toward (see below).
    - **Cubeness** (λ) — strength of the stylization. `0` is plain ARAP;
@@ -118,7 +79,7 @@ come from reshaping instead (it forms about as strongly as when the mesh
 may turn). Off by default, so existing results don't change; it has no
 effect with pins, which already hold the orientation. In Cubify Every Frame
 it makes World mode follow the animated heading exactly.
-The GPU backend implements Cube only; other targets run on the CPU solver.
+The C++ server supports all target shapes on CPU. The optional Python GPU backend implements Cube only.
 
 ## Style as Process (animation bake)
 

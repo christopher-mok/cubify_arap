@@ -1,6 +1,6 @@
 # Cubic Stylization + ARAP — Blender Add-on (C++ solver)
 
-The same tools as the Python add-on in `../cubic_stylization/` — cubify,
+The primary Blender add-on for this repository provides cubify,
 style-as-process bakes, cubify every frame, pins and interactive ARAP
 manipulation — but every solve runs in a native **C++/Eigen** process
 (`cubify_server`). Blender sends the mesh to the server and gets vertex
@@ -61,7 +61,8 @@ timings, without Blender.
 
 ## Using it
 
-Identical to the Python add-on (see its README), with these changes:
+The shared controls are documented in the [main guide](../README.md).
+The C++ add-on also provides these controls:
 
 - **Square Flat Regions** (off by default) plus a **Strength** slider,
   under Cubeness. See below.
@@ -77,9 +78,7 @@ Identical to the Python add-on (see its README), with these changes:
   Thin Walls measures against the shape before the first pass, and time
   scales with the count. It applies to Cubify Mesh, not the bakes.
 - **Threads** replaces **Device**: CPU threads for the solver, 0 = all
-  cores. There is no GPU backend and no PyTorch install. For reference,
-  the Python README's 163,842-vertex benchmark (10 iterations) takes 2.3 s
-  here, against 4.0 s for its Metal GPU run (different machines).
+  cores. There is no GPU backend and no PyTorch install. The Python add-on remains an optional reference implementation.
 
 Everything else — Target Shape (Cube, Octahedron, Pyramid, Hex Column,
 Rounded Cube with Roundness), Keep Orientation, Cubeness, Cube Orientation,
